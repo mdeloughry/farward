@@ -1,0 +1,614 @@
+#!/usr/bin/env bash
+
+set -Euo pipefail
+
+PROGRAM_NAME="$(basename "$0")"
+DEFAULT_HOST="${FARWARD_HOST:-${DOCKPORT_HOST:-${SAIL_PORTS_HOST:-dev-box}}}"
+SSH_HOST="$DEFAULT_HOST"
+BACKGROUND=false
+OPEN_BROWSER=false
+DISCOVER_DOCKER=true
+MANUAL_ONLY=false
+MANUAL_SPECS=()
+SSH_PID=""
+SSH_LOG=""
+DASHBOARD_ACTIVE=false
+COMMAND_BUFFER=""
+FRAME=0
+
+usage() {
+    cat <<USAGE
+Usage: $PROGRAM_NAME [options] [ssh-host]
+
+Interactively select published Docker ports or enter arbitrary remote TCP ports
+and forward them securely through SSH to your local computer.
+
+Options:
+  -p, --port SPEC      Add a manual remote port. SPEC may be REMOTE or REMOTE:LOCAL
+                       Repeat this option to forward several standalone services
+  -m, --manual         Skip Docker discovery and prompt for manual ports
+      --no-docker      Do not inspect Docker; use only ports supplied with --port
+  -b, --background     Start the SSH tunnel in the background, without dashboard
+  -o, --open           Open recognised HTTP services in the default browser
+  -h, --help           Show this help
+
+Dashboard controls:
+  :q                   Stop every tunnel started by this session and exit
+  Ctrl+C               Stop every tunnel started by this session and exit
+
+Environment:
+  FARWARD_HOST         Default SSH host (defaults to: dev-box)
+  DOCKPORT_HOST        Legacy fallback for compatibility
+  SAIL_PORTS_HOST      Legacy fallback for compatibility
+
+Examples:
+  $PROGRAM_NAME help
+  $PROGRAM_NAME my-dev-box
+  $PROGRAM_NAME --open user@docker-host
+  $PROGRAM_NAME --background prod-tools
+  $PROGRAM_NAME --port 8347 user@remote-host
+  $PROGRAM_NAME --port 3000:13000 --port 8025 user@remote-host
+  $PROGRAM_NAME --manual user@remote-host
+USAGE
+}
+
+fail() {
+    printf 'Error: %b\n' "$*" >&2
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+is_port_available() {
+    local port="$1"
+
+    if command_exists lsof; then
+        ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    elif command_exists ss; then
+        ! ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN
+    elif command_exists netstat; then
+        ! netstat -an 2>/dev/null | grep -Eq "[.:]${port}[[:space:]].*LISTEN"
+    else
+        return 0
+    fi
+}
+
+preferred_local_port() {
+    local remote_port="$1"
+
+    case "$remote_port" in
+        80)  printf '8080\n' ;;
+        443) printf '8443\n' ;;
+        *)
+            if (( remote_port < 1024 )); then
+                printf '%s\n' "$((remote_port + 8000))"
+            else
+                printf '%s\n' "$remote_port"
+            fi
+            ;;
+    esac
+}
+
+next_available_port() {
+    local port="$1"
+    while ! is_port_available "$port"; do
+        port=$((port + 1))
+        if (( port > 65535 )); then
+            fail "Could not find an available local port."
+        fi
+    done
+    printf '%s\n' "$port"
+}
+
+open_url() {
+    local url="$1"
+    if command_exists open; then
+        open "$url" >/dev/null 2>&1 || true
+    elif command_exists xdg-open; then
+        xdg-open "$url" >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup() {
+    local exit_code=$?
+    trap - EXIT INT TERM HUP
+
+    if [[ -n "${SSH_PID:-}" ]] && kill -0 "$SSH_PID" 2>/dev/null; then
+        kill "$SSH_PID" 2>/dev/null || true
+        wait "$SSH_PID" 2>/dev/null || true
+    fi
+
+    if [[ "$DASHBOARD_ACTIVE" == true ]]; then
+        printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
+    fi
+
+    [[ -n "${SSH_LOG:-}" ]] && rm -f "$SSH_LOG" 2>/dev/null || true
+
+    exit "$exit_code"
+}
+
+shutdown_cleanly() {
+    trap - EXIT
+    if [[ -n "${SSH_PID:-}" ]] && kill -0 "$SSH_PID" 2>/dev/null; then
+        kill "$SSH_PID" 2>/dev/null || true
+        wait "$SSH_PID" 2>/dev/null || true
+    fi
+    if [[ "$DASHBOARD_ACTIVE" == true ]]; then
+        printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
+    fi
+    exit 0
+}
+
+terminal_size() {
+    local rows cols
+    rows="$(tput lines 2>/dev/null || printf '24')"
+    cols="$(tput cols 2>/dev/null || printf '80')"
+    (( rows < 8 )) && rows=8
+    (( cols < 20 )) && cols=20
+    printf '%s %s\n' "$rows" "$cols"
+}
+
+put_text() {
+    local row="$1"
+    local col="$2"
+    local text="$3"
+    local max_len
+
+    (( row >= 0 && row < SCREEN_ROWS )) || return 0
+    (( col >= 0 && col < SCREEN_COLS )) || return 0
+
+    max_len=$((SCREEN_COLS - col))
+    text="${text:0:max_len}"
+    SCREEN_LINES[$row]="${SCREEN_LINES[$row]:0:col}${text}${SCREEN_LINES[$row]:col+${#text}}"
+}
+
+make_border() {
+    local width="$1"
+    local result=""
+    printf -v result '%*s' "$width" ''
+    printf '%s' "${result// /-}"
+}
+
+render_dashboard_frame() {
+    local size row col i item local_side remote_side
+    local panel_width panel_height panel_left panel_top inner_width
+    local border title status command_line max_forwards visible_forwards
+    local star_count x y glyph line output=""
+
+    read -r SCREEN_ROWS SCREEN_COLS < <(terminal_size)
+
+    SCREEN_LINES=()
+    printf -v line '%*s' "$SCREEN_COLS" ''
+    for ((row=0; row<SCREEN_ROWS; row++)); do
+        SCREEN_LINES+=("$line")
+    done
+
+    # Sparse moving star field across the entire terminal.
+    star_count=$((SCREEN_ROWS * SCREEN_COLS / 90))
+    (( star_count < 24 )) && star_count=24
+    for ((i=0; i<star_count; i++)); do
+        x=$(((i * 47 + FRAME * (1 + i % 3)) % SCREEN_COLS))
+        y=$(((i * 29 + FRAME / (2 + i % 4)) % SCREEN_ROWS))
+        case $(((i + FRAME / 3) % 11)) in
+            0) glyph='*' ;;
+            1|2) glyph='+' ;;
+            *) glyph='.' ;;
+        esac
+        put_text "$y" "$x" "$glyph"
+    done
+
+    panel_width=$((SCREEN_COLS - 6))
+    (( panel_width > 92 )) && panel_width=92
+    (( panel_width < 38 )) && panel_width=$((SCREEN_COLS - 2))
+
+    max_forwards=$((SCREEN_ROWS - 12))
+    (( max_forwards < 1 )) && max_forwards=1
+    visible_forwards=${#summary[@]}
+    (( visible_forwards > max_forwards )) && visible_forwards=$max_forwards
+
+    panel_height=$((visible_forwards + 9))
+    (( panel_height > SCREEN_ROWS - 2 )) && panel_height=$((SCREEN_ROWS - 2))
+    panel_left=$(((SCREEN_COLS - panel_width) / 2))
+    panel_top=$(((SCREEN_ROWS - panel_height) / 2))
+    (( panel_top < 1 )) && panel_top=1
+    inner_width=$((panel_width - 2))
+    border="$(make_border "$inner_width")"
+
+    put_text "$panel_top" "$panel_left" "+${border}+"
+    for ((row=1; row<panel_height-1; row++)); do
+        put_text "$((panel_top + row))" "$panel_left" "|"
+        put_text "$((panel_top + row))" "$((panel_left + panel_width - 1))" "|"
+    done
+    put_text "$((panel_top + panel_height - 1))" "$panel_left" "+${border}+"
+
+    title=" FARWARD "
+    put_text "$panel_top" "$((panel_left + 3))" "$title"
+    put_text "$((panel_top + 2))" "$((panel_left + 3))" "Host: $SSH_HOST"
+    status="Status: connected   SSH PID: $SSH_PID"
+    put_text "$((panel_top + 3))" "$((panel_left + 3))" "$status"
+    put_text "$((panel_top + 5))" "$((panel_left + 3))" "ACTIVE FORWARDS"
+
+    row=$((panel_top + 6))
+    for ((i=0; i<visible_forwards; i++)); do
+        item="${summary[$i]}"
+        local_side="${item%%|*}"
+        remote_side="${item#*|}"
+        put_text "$row" "$((panel_left + 4))" "> ${local_side} -> ${remote_side}"
+        row=$((row + 1))
+    done
+    if (( ${#summary[@]} > visible_forwards )); then
+        put_text "$((row - 1))" "$((panel_left + 4))" "... and $((${#summary[@]} - visible_forwards + 1)) more"
+    fi
+
+    command_line="Command: ${COMMAND_BUFFER}"
+    put_text "$((panel_top + panel_height - 3))" "$((panel_left + 3))" "Type :q then Enter to stop all tunnels (or press q then Enter)"
+    put_text "$((panel_top + panel_height - 2))" "$((panel_left + 3))" "$command_line"
+
+    for ((row=0; row<SCREEN_ROWS; row++)); do
+        output+="${SCREEN_LINES[$row]}"
+        (( row < SCREEN_ROWS - 1 )) && output+=$'\n'
+    done
+
+    # Synchronized output prevents partially drawn frames in terminals that support it.
+    printf '\033[?2026h\033[H%s\033[?2026l' "$output"
+}
+
+run_dashboard() {
+    local key=""
+    DASHBOARD_ACTIVE=true
+    printf '\033[?1049h\033[2J\033[H\033[?25l\033[?7l'
+
+    while kill -0 "$SSH_PID" 2>/dev/null; do
+        render_dashboard_frame
+        key=""
+
+        if IFS= read -rsn1 -t 0.12 key </dev/tty; then
+            case "$key" in
+                ""|$'\n'|$'\r')
+                    if [[ "$COMMAND_BUFFER" == ":q" || "$COMMAND_BUFFER" == "q" ]]; then
+                        shutdown_cleanly
+                    fi
+                    COMMAND_BUFFER=""
+                    ;;
+                $'\177'|$'\b')
+                    COMMAND_BUFFER="${COMMAND_BUFFER%?}"
+                    ;;
+                *)
+                    if [[ "$key" =~ [[:print:]] ]]; then
+                        COMMAND_BUFFER="${COMMAND_BUFFER}${key}"
+                        COMMAND_BUFFER="${COMMAND_BUFFER:0:32}"
+                    fi
+                    ;;
+            esac
+        fi
+
+        FRAME=$((FRAME + 1))
+    done
+
+    wait "$SSH_PID" || true
+    printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
+    DASHBOARD_ACTIVE=false
+    local ssh_error=""
+    if [[ -n "${SSH_LOG:-}" && -s "$SSH_LOG" ]]; then
+        ssh_error="$(cat "$SSH_LOG")"
+    fi
+    if [[ -n "$ssh_error" ]]; then
+        fail "The SSH tunnel closed unexpectedly:
+$ssh_error"
+    fi
+    fail "The SSH tunnel closed unexpectedly."
+}
+
+validate_port_number() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+prompt_manual_port() {
+    local remote_port="" local_port="" entered=""
+
+    while true; do
+        printf 'Remote TCP port (1-65535, blank to finish): ' >/dev/tty
+        IFS= read -r entered </dev/tty || return 1
+        [[ -z "$entered" ]] && return 1
+        if validate_port_number "$entered"; then
+            remote_port="$entered"
+            break
+        fi
+        printf 'Port "%s" is invalid. TCP ports must be between 1 and 65535.\n' "$entered" >/dev/tty
+    done
+
+    printf '%s\t%s\tmanual\ttcp\n' "manual:$remote_port" "$remote_port"
+}
+
+parse_manual_spec() {
+    local spec="$1" remote localp
+    if [[ "$spec" == *:* ]]; then
+        remote="${spec%%:*}"
+        localp="${spec#*:}"
+    else
+        remote="$spec"
+        localp=""
+    fi
+    validate_port_number "$remote" || fail "Remote port '$remote' is invalid; use a number from 1 to 65535."
+    if [[ -n "$localp" ]]; then
+        validate_port_number "$localp" || fail "Local port '$localp' is invalid; use a number from 1 to 65535."
+    fi
+    printf '%s\t%s\tmanual\ttcp\t%s\n' "manual:$remote" "$remote" "$localp"
+}
+
+trap cleanup EXIT INT TERM HUP
+
+# Running Farward without a destination is intentionally non-destructive:
+# show help instead of guessing a host or attempting an SSH connection.
+if (( $# == 0 )); then
+    usage
+    exit 0
+fi
+
+while (($#)); do
+    case "$1" in
+        -p|--port)
+            [[ $# -ge 2 ]] || fail "--port requires REMOTE or REMOTE:LOCAL."
+            MANUAL_SPECS+=("$2")
+            shift 2
+            ;;
+        -m|--manual)
+            MANUAL_ONLY=true
+            DISCOVER_DOCKER=false
+            shift
+            ;;
+        --no-docker)
+            DISCOVER_DOCKER=false
+            shift
+            ;;
+        -b|--background)
+            BACKGROUND=true
+            shift
+            ;;
+        -o|--open)
+            OPEN_BROWSER=true
+            shift
+            ;;
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            fail "Unknown option: $1"
+            ;;
+        *)
+            SSH_HOST="$1"
+            shift
+            ;;
+    esac
+done
+
+command_exists ssh || fail "ssh is required."
+if [[ "$MANUAL_ONLY" != true ]]; then
+    command_exists fzf || fail "fzf is required for the selector. Install it with: brew install fzf  OR  sudo apt install fzf"
+fi
+
+printf 'Checking %s...\n' "$SSH_HOST"
+
+selection_rows=""
+if [[ "$DISCOVER_DOCKER" == true ]]; then
+    remote_output="$(
+        ssh \
+            -o BatchMode=yes \
+            -o ConnectTimeout=8 \
+            "$SSH_HOST" \
+            "docker ps --format '{{.Names}}|{{.Ports}}'" 2>&1
+    )" || remote_output=""
+
+    if [[ -n "$remote_output" ]]; then
+        ports="$(
+            printf '%s\n' "$remote_output" |
+            awk -F'|' '
+            {
+                container = $1
+                mappings = $2
+
+                while (match(mappings, /(([0-9a-fA-F:.]+):)?[0-9]+->[0-9]+\/(tcp|udp)/)) {
+                    mapping = substr(mappings, RSTART, RLENGTH)
+                    protocol = mapping
+                    sub(/^.*\//, "", protocol)
+
+                    split(mapping, arrow, "->")
+                    host_side = arrow[1]
+                    container_side = arrow[2]
+
+                    sub(/^.*:/, "", host_side)
+                    sub(/\/.*/, "", container_side)
+
+                    printf "%s\t%s\t%s\t%s\n", container, host_side, container_side, protocol
+                    mappings = substr(mappings, RSTART + RLENGTH)
+                }
+            }' |
+            sort -t $'\t' -k1,1 -k2,2n -u
+        )"
+        if [[ -n "$ports" ]]; then
+            selection_rows="$(
+                printf '%s\n' "$ports" |
+                awk -F'\t' '{ printf "%-30s host:%-6s container:%-6s %s\t%s\t%s\t%s\t\n", $1, $2, $3, $4, $2, $3, $4 }'
+            )"
+        fi
+    fi
+fi
+
+for spec in "${MANUAL_SPECS[@]}"; do
+    parsed="$(parse_manual_spec "$spec")"
+    IFS=$'\t' read -r label remote_port _kind protocol local_override <<< "$parsed"
+    selection_rows+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t%s' "$label" "$remote_port" "$local_override")"$'\n'
+done
+
+if [[ "$MANUAL_ONLY" == true ]]; then
+    selection=""
+    while manual_row="$(prompt_manual_port)"; do
+        selection+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t' "${manual_row%%$'\t'*}" "$(printf '%s' "$manual_row" | cut -f2)")"$'\n'
+    done
+    [[ -n "$selection" ]] || exit 0
+elif [[ -n "$selection_rows" ]]; then
+    selection_rows+="$(printf '%-30s %s\t%s\t%s\t%s\t' '[manual port]' 'enter an arbitrary remote TCP port' '__MANUAL__' 'manual' 'tcp')"
+    selection="$(
+        printf '%s\n' "$selection_rows" |
+        fzf \
+            --multi \
+            --delimiter=$'\t' \
+            --with-nth=1 \
+            --prompt='Forward ports > ' \
+            --header='TAB selects multiple ports · choose [manual port] for a standalone service' \
+            --height=80% \
+            --border
+    )" || exit 0
+    [[ -n "$selection" ]] || exit 0
+
+    if grep -q $'\t__MANUAL__\t' <<< "$selection"; then
+        selection="$(printf '%s\n' "$selection" | grep -v $'\t__MANUAL__\t' || true)"
+        while manual_row="$(prompt_manual_port)"; do
+            remote_port="$(printf '%s' "$manual_row" | cut -f2)"
+            selection+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t' "manual:$remote_port" "$remote_port" "$remote_port")"$'\n'
+            printf 'Add another manual port? [y/N]: ' >/dev/tty
+            IFS= read -r again </dev/tty
+            [[ "$again" =~ ^[Yy]$ ]] || break
+        done
+    fi
+else
+    printf 'No published Docker ports were found. Enter standalone remote ports instead.\n'
+    selection=""
+    while manual_row="$(prompt_manual_port)"; do
+        remote_port="$(printf '%s' "$manual_row" | cut -f2)"
+        selection+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t' "manual:$remote_port" "$remote_port" "$remote_port")"$'\n'
+    done
+    [[ -n "$selection" ]] || exit 0
+fi
+
+forward_args=()
+summary=()
+urls=()
+
+while IFS=$'\t' read -r display remote_port container_port protocol local_override; do
+    [[ "$protocol" == "tcp" ]] || {
+        printf 'Skipping UDP port %s; SSH local forwarding supports TCP only.\n' "$remote_port" >&2
+        continue
+    }
+
+    if [[ -n "${local_override:-}" ]]; then
+        preferred_port="$local_override"
+    else
+        preferred_port="$(preferred_local_port "$remote_port")"
+    fi
+    suggested_port="$(next_available_port "$preferred_port")"
+    local_port="$suggested_port"
+
+    while true; do
+        if [[ -r /dev/tty && -w /dev/tty ]]; then
+            if (( remote_port < 1024 )); then
+                printf 'Remote port %s cannot normally bind to the same local port without elevated privileges.\n' "$remote_port"
+            fi
+            printf 'Local port for remote %s [%s]: ' "$remote_port" "$suggested_port"
+            IFS= read -r entered_port </dev/tty
+            local_port="${entered_port:-$suggested_port}"
+        fi
+
+        if [[ ! "$local_port" =~ ^[0-9]+$ ]] || (( local_port < 1 || local_port > 65535 )); then
+            if [[ -r /dev/tty && -w /dev/tty ]]; then
+                printf 'Port "%s" is invalid. Enter a number between 1 and 65535.\n' "$local_port" >&2
+                local_port=""
+                continue
+            fi
+            fail "Invalid local port: $local_port"
+        fi
+
+        if (( local_port < 1024 )) && [[ "$(id -u)" -ne 0 ]]; then
+            suggested_port="$(next_available_port "$(preferred_local_port "$remote_port")")"
+            if [[ -r /dev/tty && -w /dev/tty ]]; then
+                printf 'Local port %s is blocked for normal users. Choose an alternative; suggested: %s.\n'                     "$local_port" "$suggested_port" >&2
+                local_port=""
+                continue
+            fi
+            fail "Local port $local_port is privileged."
+        fi
+
+        if ! is_port_available "$local_port"; then
+            suggested_port="$(next_available_port "$((local_port + 1))")"
+            if [[ -r /dev/tty && -w /dev/tty ]]; then
+                printf 'Local port %s is already in use. Choose an alternative; suggested: %s.\n'                     "$local_port" "$suggested_port" >&2
+                local_port=""
+                continue
+            fi
+            fail "Local port $local_port is already in use."
+        fi
+
+        break
+    done
+
+    forward_args+=("-L" "${local_port}:127.0.0.1:${remote_port}")
+    summary+=("localhost:${local_port}|${SSH_HOST}:${remote_port}")
+
+    browser_port="$container_port"
+    [[ "$container_port" == "manual" ]] && browser_port="$remote_port"
+    case "$browser_port" in
+        80|443|3000|4173|5000|5173|8000|8080|8025|7700)
+            if [[ "$browser_port" == "443" ]]; then
+                urls+=("https://localhost:${local_port}")
+            else
+                urls+=("http://localhost:${local_port}")
+            fi
+            ;;
+    esac
+done <<< "$selection"
+
+((${#forward_args[@]} > 0)) || fail "No TCP ports were selected."
+
+ssh_args=(
+    -o ExitOnForwardFailure=yes
+    -o ServerAliveInterval=30
+    -o ServerAliveCountMax=3
+    -o TCPKeepAlive=yes
+)
+
+if [[ "$BACKGROUND" == true ]]; then
+    ssh "${ssh_args[@]}" -fN "${forward_args[@]}" "$SSH_HOST"
+    printf '\nTunnel started in the background.\n'
+    for item in "${summary[@]}"; do
+        printf '  %s → %s\n' "${item%%|*}" "${item#*|}"
+    done
+    printf 'Stop it with: pkill -f "ssh.*%s"\n' "$SSH_HOST"
+    trap - EXIT
+    exit 0
+fi
+
+printf '\nStarting SSH tunnel...\n'
+for item in "${summary[@]}"; do
+    printf '  %s → %s\n' "${item%%|*}" "${item#*|}"
+done
+printf '\n'
+
+SSH_LOG="$(mktemp -t farward-ssh.XXXXXX)"
+ssh "${ssh_args[@]}" -N "${forward_args[@]}" "$SSH_HOST" 2>"$SSH_LOG" &
+SSH_PID=$!
+
+sleep 0.5
+if ! kill -0 "$SSH_PID" 2>/dev/null; then
+    wait "$SSH_PID" || true
+    if [[ -s "$SSH_LOG" ]]; then
+        fail "SSH could not establish the selected forwards:
+$(cat "$SSH_LOG")"
+    fi
+    fail "SSH could not establish the selected forwards."
+fi
+
+if [[ "$OPEN_BROWSER" == true ]]; then
+    for url in "${urls[@]}"; do
+        open_url "$url"
+    done
+fi
+
+run_dashboard
