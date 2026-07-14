@@ -5,16 +5,25 @@ set -Euo pipefail
 PROGRAM_NAME="$(basename "$0")"
 DEFAULT_HOST="${FARWARD_HOST:-${DOCKPORT_HOST:-${SAIL_PORTS_HOST:-dev-box}}}"
 SSH_HOST="$DEFAULT_HOST"
+LOCAL_BIND_HOST="${FARWARD_BIND_HOST:-localhost}"
+TARGET_HOST="${FARWARD_TARGET_HOST:-localhost}"
+TARGET_HOST_EXPLICIT=false
 BACKGROUND=false
 OPEN_BROWSER=false
+DIAGNOSE=false
+DRY_RUN=false
+SELF_TEST=false
 DISCOVER_DOCKER=true
 MANUAL_ONLY=false
 MANUAL_SPECS=()
+ssh_common_args=()
 SSH_PID=""
 SSH_LOG=""
 DASHBOARD_ACTIVE=false
 COMMAND_BUFFER=""
 FRAME=0
+ORIG_TTY_SETTINGS=""
+DASHBOARD_TTY_POLL=false
 
 usage() {
     cat <<USAGE
@@ -26,10 +35,15 @@ and forward them securely through SSH to your local computer.
 Options:
   -p, --port SPEC      Add a manual remote port. SPEC may be REMOTE or REMOTE:LOCAL
                        Repeat this option to forward several standalone services
+  -t, --target-host HOST
+                       Remote-side host to connect to (default: $TARGET_HOST)
   -m, --manual         Skip Docker discovery and prompt for manual ports
       --no-docker      Do not inspect Docker; use only ports supplied with --port
   -b, --background     Start the SSH tunnel in the background, without dashboard
   -o, --open           Open recognised HTTP services in the default browser
+      --diagnose       Check remote target reachability and exit without tunneling
+      --dry-run        Print resolved forwards and SSH arguments without tunneling
+      --self-test      Run Farward's local smoke test and exit
   -h, --help           Show this help
 
 Dashboard controls:
@@ -38,6 +52,9 @@ Dashboard controls:
 
 Environment:
   FARWARD_HOST         Default SSH host (defaults to: dev-box)
+  FARWARD_BIND_HOST    Local bind address for forwarded ports (defaults to: localhost)
+  FARWARD_SSH_CONFIG   Optional ssh_config file to pass to ssh with -F
+  FARWARD_TARGET_HOST  Remote-side target host for forwards (defaults to: localhost)
   DOCKPORT_HOST        Legacy fallback for compatibility
   SAIL_PORTS_HOST      Legacy fallback for compatibility
 
@@ -59,6 +76,44 @@ fail() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+ssh_command() {
+    if ((${#ssh_common_args[@]} > 0)); then
+        ssh "${ssh_common_args[@]}" "$@"
+    else
+        ssh "$@"
+    fi
+}
+
+script_path() {
+    local dir
+
+    if [[ "$0" == */* ]]; then
+        dir="$(cd "$(dirname "$0")" && pwd -P)"
+        printf '%s/%s\n' "$dir" "$(basename "$0")"
+    else
+        command -v "$0"
+    fi
+}
+
+run_self_test() {
+    local self smoke_script data_home
+
+    self="$(script_path)"
+    data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+    if [[ -n "${FARWARD_SMOKE_TEST:-}" ]]; then
+        smoke_script="$FARWARD_SMOKE_TEST"
+    elif [[ -x "$(dirname "$self")/tests/smoke.sh" ]]; then
+        smoke_script="$(dirname "$self")/tests/smoke.sh"
+    elif [[ -x "$data_home/farward/smoke.sh" ]]; then
+        smoke_script="$data_home/farward/smoke.sh"
+    else
+        fail "Could not find Farward smoke test. Reinstall with ./install.sh or set FARWARD_SMOKE_TEST."
+    fi
+
+    FARWARD_BIN="$self" "$smoke_script"
 }
 
 is_port_available() {
@@ -121,12 +176,60 @@ cleanup() {
     fi
 
     if [[ "$DASHBOARD_ACTIVE" == true ]]; then
+        restore_dashboard_tty
         printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
     fi
 
     [[ -n "${SSH_LOG:-}" ]] && rm -f "$SSH_LOG" 2>/dev/null || true
 
     exit "$exit_code"
+}
+
+setup_dashboard_tty() {
+    local tty_settings=""
+
+    DASHBOARD_TTY_POLL=false
+    [[ -r /dev/tty ]] || return 0
+
+    tty_settings="$(stty -g </dev/tty 2>/dev/null || true)"
+    [[ -n "$tty_settings" ]] || return 0
+
+    # Bash 3.2 only accepts whole seconds for read -t. Terminal min/time gives
+    # us a nonblocking single-character read while sleep controls frame rate.
+    if stty -echo -icanon min 0 time 0 </dev/tty 2>/dev/null; then
+        ORIG_TTY_SETTINGS="$tty_settings"
+        DASHBOARD_TTY_POLL=true
+    fi
+}
+
+restore_dashboard_tty() {
+    DASHBOARD_TTY_POLL=false
+    [[ -n "${ORIG_TTY_SETTINGS:-}" ]] || return 0
+
+    stty "$ORIG_TTY_SETTINGS" </dev/tty 2>/dev/null || true
+    ORIG_TTY_SETTINGS=""
+}
+
+handle_dashboard_key() {
+    local key="$1"
+
+    case "$key" in
+        ""|$'\n'|$'\r')
+            if [[ "$COMMAND_BUFFER" == ":q" || "$COMMAND_BUFFER" == "q" ]]; then
+                shutdown_cleanly
+            fi
+            COMMAND_BUFFER=""
+            ;;
+        $'\177'|$'\b')
+            COMMAND_BUFFER="${COMMAND_BUFFER%?}"
+            ;;
+        *)
+            if [[ "$key" =~ [[:print:]] ]]; then
+                COMMAND_BUFFER="${COMMAND_BUFFER}${key}"
+                COMMAND_BUFFER="${COMMAND_BUFFER:0:32}"
+            fi
+            ;;
+    esac
 }
 
 shutdown_cleanly() {
@@ -136,18 +239,17 @@ shutdown_cleanly() {
         wait "$SSH_PID" 2>/dev/null || true
     fi
     if [[ "$DASHBOARD_ACTIVE" == true ]]; then
+        restore_dashboard_tty
         printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
     fi
     exit 0
 }
 
 terminal_size() {
-    local rows cols
-    rows="$(tput lines 2>/dev/null || printf '24')"
-    cols="$(tput cols 2>/dev/null || printf '80')"
-    (( rows < 8 )) && rows=8
-    (( cols < 20 )) && cols=20
-    printf '%s %s\n' "$rows" "$cols"
+    SCREEN_ROWS="$(tput lines 2>/dev/null || printf '24')"
+    SCREEN_COLS="$(tput cols 2>/dev/null || printf '80')"
+    (( SCREEN_ROWS < 8 )) && SCREEN_ROWS=8
+    (( SCREEN_COLS < 20 )) && SCREEN_COLS=20
 }
 
 put_text() {
@@ -175,9 +277,9 @@ render_dashboard_frame() {
     local size row col i item local_side remote_side
     local panel_width panel_height panel_left panel_top inner_width
     local border title status command_line max_forwards visible_forwards
-    local star_count x y glyph line output=""
+    local star_count x y glyph line panel_blank output=""
 
-    read -r SCREEN_ROWS SCREEN_COLS < <(terminal_size)
+    terminal_size
 
     SCREEN_LINES=()
     printf -v line '%*s' "$SCREEN_COLS" ''
@@ -215,6 +317,11 @@ render_dashboard_frame() {
     (( panel_top < 1 )) && panel_top=1
     inner_width=$((panel_width - 2))
     border="$(make_border "$inner_width")"
+    printf -v panel_blank '%*s' "$panel_width" ''
+
+    for ((row=0; row<panel_height; row++)); do
+        put_text "$((panel_top + row))" "$panel_left" "$panel_blank"
+    done
 
     put_text "$panel_top" "$panel_left" "+${border}+"
     for ((row=1; row<panel_height-1; row++)); do
@@ -255,39 +362,188 @@ render_dashboard_frame() {
     printf '\033[?2026h\033[H%s\033[?2026l' "$output"
 }
 
-run_dashboard() {
+run_dashboard_python() {
+    python3 - "$SSH_PID" "$SSH_HOST" "${summary[@]}" <<'PY'
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+pid = int(sys.argv[1])
+ssh_host = sys.argv[2]
+summary = sys.argv[3:]
+command = ""
+frame = 0
+tty_file = None
+tty_fd = None
+old_term = None
+
+
+def ssh_alive():
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return True
+
+    if result.returncode != 0:
+        return False
+    return not result.stdout.strip().startswith("Z")
+
+
+def put_text(lines, row, col, text):
+    rows = len(lines)
+    cols = len(lines[0]) if rows else 0
+    if row < 0 or row >= rows or col < 0 or col >= cols:
+        return
+    text = text[: cols - col]
+    for index, char in enumerate(text):
+        lines[row][col + index] = char
+
+
+def render():
+    cols, rows = shutil.get_terminal_size((80, 24))
+    rows = max(rows, 8)
+    cols = max(cols, 20)
+    lines = [[" "] * cols for _ in range(rows)]
+
+    star_count = max(rows * cols // 90, 24)
+    for i in range(star_count):
+        x = (i * 47 + frame * (1 + i % 3)) % cols
+        y = (i * 29 + frame // (2 + i % 4)) % rows
+        phase = (i + frame // 3) % 11
+        glyph = "*" if phase == 0 else "+" if phase in (1, 2) else "."
+        put_text(lines, y, x, glyph)
+
+    panel_width = cols - 6
+    if panel_width > 92:
+        panel_width = 92
+    if panel_width < 38:
+        panel_width = cols - 2
+
+    max_forwards = max(rows - 12, 1)
+    visible = min(len(summary), max_forwards)
+    panel_height = min(visible + 9, rows - 2)
+    panel_left = max((cols - panel_width) // 2, 0)
+    panel_top = max((rows - panel_height) // 2, 1)
+    inner_width = max(panel_width - 2, 1)
+    border = "-" * inner_width
+
+    for row in range(panel_height):
+        put_text(lines, panel_top + row, panel_left, " " * panel_width)
+
+    put_text(lines, panel_top, panel_left, "+" + border + "+")
+    for row in range(1, max(panel_height - 1, 1)):
+        put_text(lines, panel_top + row, panel_left, "|")
+        put_text(lines, panel_top + row, panel_left + panel_width - 1, "|")
+    put_text(lines, panel_top + panel_height - 1, panel_left, "+" + border + "+")
+
+    put_text(lines, panel_top, panel_left + 3, " FARWARD ")
+    put_text(lines, panel_top + 2, panel_left + 3, "Host: " + ssh_host)
+    put_text(lines, panel_top + 3, panel_left + 3, "Status: connected   SSH PID: " + str(pid))
+    put_text(lines, panel_top + 5, panel_left + 3, "ACTIVE FORWARDS")
+
+    row = panel_top + 6
+    for item in summary[:visible]:
+        local_side, _, remote_side = item.partition("|")
+        put_text(lines, row, panel_left + 4, "> " + local_side + " -> " + remote_side)
+        row += 1
+    if len(summary) > visible:
+        put_text(lines, row - 1, panel_left + 4, "... and " + str(len(summary) - visible + 1) + " more")
+
+    put_text(lines, panel_top + panel_height - 3, panel_left + 3, "Type :q then Enter to stop all tunnels")
+    put_text(lines, panel_top + panel_height - 2, panel_left + 3, "Command: " + command)
+
+    output = "\n".join("".join(line) for line in lines)
+    sys.stdout.write("\033[?2026h\033[H" + output + "\033[?2026l")
+    sys.stdout.flush()
+
+
+try:
+    tty_file = open("/dev/tty", "rb", buffering=0)
+    tty_fd = tty_file.fileno()
+    old_term = termios.tcgetattr(tty_fd)
+    tty.setcbreak(tty_fd)
+
+    sys.stdout.write("\033[?1049h\033[2J\033[H\033[?25l\033[?7l")
+    sys.stdout.flush()
+
+    while ssh_alive():
+        render()
+
+        while select.select([tty_fd], [], [], 0)[0]:
+            data = os.read(tty_fd, 32)
+            if not data:
+                break
+
+            for char in data.decode(errors="ignore"):
+                if char in ("\r", "\n"):
+                    if command in (":q", "q"):
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except OSError:
+                            pass
+                        raise SystemExit(2)
+                    command = ""
+                elif char in ("\x7f", "\b"):
+                    command = command[:-1]
+                elif char.isprintable():
+                    command = (command + char)[:32]
+
+        frame += 1
+        time.sleep(0.12)
+
+    raise SystemExit(3)
+finally:
+    if old_term is not None:
+        try:
+            termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_term)
+        except termios.error:
+            pass
+    if tty_file is not None:
+        tty_file.close()
+    sys.stdout.write("\033[?2026l\033[?7h\033[?25h\033[?1049l")
+    sys.stdout.flush()
+PY
+}
+
+run_dashboard_bash() {
     local key=""
     DASHBOARD_ACTIVE=true
     printf '\033[?1049h\033[2J\033[H\033[?25l\033[?7l'
+    setup_dashboard_tty
 
     while kill -0 "$SSH_PID" 2>/dev/null; do
         render_dashboard_frame
         key=""
 
-        if IFS= read -rsn1 -t 0.12 key </dev/tty; then
-            case "$key" in
-                ""|$'\n'|$'\r')
-                    if [[ "$COMMAND_BUFFER" == ":q" || "$COMMAND_BUFFER" == "q" ]]; then
-                        shutdown_cleanly
-                    fi
-                    COMMAND_BUFFER=""
-                    ;;
-                $'\177'|$'\b')
-                    COMMAND_BUFFER="${COMMAND_BUFFER%?}"
-                    ;;
-                *)
-                    if [[ "$key" =~ [[:print:]] ]]; then
-                        COMMAND_BUFFER="${COMMAND_BUFFER}${key}"
-                        COMMAND_BUFFER="${COMMAND_BUFFER:0:32}"
-                    fi
-                    ;;
-            esac
+        if [[ "$DASHBOARD_TTY_POLL" == true ]]; then
+            while IFS= read -rsn1 key </dev/tty; do
+                [[ -n "$key" ]] || break
+                handle_dashboard_key "$key"
+            done
         fi
 
         FRAME=$((FRAME + 1))
+        sleep 0.12
     done
 
     wait "$SSH_PID" || true
+    restore_dashboard_tty
     printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
     DASHBOARD_ACTIVE=false
     local ssh_error=""
@@ -301,9 +557,160 @@ $ssh_error"
     fail "The SSH tunnel closed unexpectedly."
 }
 
+run_dashboard() {
+    local dashboard_status=0
+
+    if command_exists python3; then
+        DASHBOARD_ACTIVE=true
+        set +e
+        run_dashboard_python
+        dashboard_status=$?
+        set -e
+        DASHBOARD_ACTIVE=false
+
+        if (( dashboard_status == 2 )); then
+            shutdown_cleanly
+        fi
+
+        if (( dashboard_status != 3 )) && [[ -n "${SSH_PID:-}" ]] && kill -0 "$SSH_PID" 2>/dev/null; then
+            kill "$SSH_PID" 2>/dev/null || true
+            wait "$SSH_PID" 2>/dev/null || true
+            fail "The dashboard exited unexpectedly; the SSH tunnel was stopped."
+        fi
+
+        wait "$SSH_PID" || true
+        local ssh_error=""
+        if [[ -n "${SSH_LOG:-}" && -s "$SSH_LOG" ]]; then
+            ssh_error="$(cat "$SSH_LOG")"
+        fi
+        if [[ -n "$ssh_error" ]]; then
+            fail "The SSH tunnel closed unexpectedly:
+$ssh_error"
+        fi
+        fail "The SSH tunnel closed unexpectedly."
+    fi
+
+    run_dashboard_bash
+}
+
 validate_port_number() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+validate_target_host() {
+    local host="$1"
+    [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+validate_bind_host() {
+    local host="$1"
+    [[ "$host" == "localhost" || "$host" =~ ^[0-9]+(\.[0-9]+){3}$ ]]
+}
+
+diagnose_remote_target() {
+    local target_host="$1"
+    local remote_port="$2"
+    local remote_command
+    local output
+
+    remote_command="host=$target_host; port=$remote_port; py='import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 3).close()'; if command -v python3 >/dev/null 2>&1; then python3 -c \"\$py\" \"\$host\" \"\$port\"; elif command -v python >/dev/null 2>&1; then python -c \"\$py\" \"\$host\" \"\$port\"; elif command -v nc >/dev/null 2>&1; then nc -z -w 3 \"\$host\" \"\$port\" 2>/dev/null || nc -z -G 3 \"\$host\" \"\$port\" 2>/dev/null; elif command -v timeout >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then timeout 3 bash -c ':</dev/tcp/\$1/\$2' -- \"\$host\" \"\$port\"; else echo 'remote host has no supported TCP probe tool for diagnosis (python3, python, nc with timeout, or timeout+bash)' >&2; exit 127; fi"
+
+    printf 'Checking remote reachability: %s -> %s:%s ... ' "$SSH_HOST" "$target_host" "$remote_port"
+    if output="$(ssh_command -o BatchMode=yes -o ConnectTimeout=8 "$SSH_HOST" "$remote_command" 2>&1)"; then
+        printf 'ok\n'
+        return 0
+    fi
+
+    printf 'failed\n'
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" >&2
+    fi
+    return 1
+}
+
+forward_target_error_pattern() {
+    printf '%s\n' 'open failed|connect failed|connection refused|administratively prohibited|name or service not known|no route to host|network is unreachable'
+}
+
+fail_forward_target() {
+    local local_port="$1"
+    local target_host="$2"
+    local remote_port="$3"
+
+    fail "SSH could not connect from $SSH_HOST to $target_host:$remote_port for local port $local_port.
+$(cat "$SSH_LOG")
+
+If the service is not bound to remote localhost, retry with --target-host HOST."
+}
+
+has_forward_target_error() {
+    [[ -s "$SSH_LOG" ]] && grep -Eiq "$(forward_target_error_pattern)" "$SSH_LOG"
+}
+
+can_connect_local() {
+    local host="$1"
+    local port="$2"
+
+    if command_exists python3; then
+        python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), 0.5):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY
+        return $?
+    fi
+
+    if command_exists nc; then
+        nc -z -w 1 "$host" "$port" >/dev/null 2>&1 ||
+            nc -z -G 1 "$host" "$port" >/dev/null 2>&1
+        return $?
+    fi
+
+    return 2
+}
+
+probe_forward_target() {
+    local local_port="$1"
+    local bind_host="$2"
+    local target_host="$3"
+    local remote_port="$4"
+    local deadline
+    local listener_seen=false
+
+    command_exists python3 || command_exists nc || return 0
+
+    : >"$SSH_LOG"
+    deadline=$((SECONDS + 3))
+    while (( SECONDS <= deadline )); do
+        if can_connect_local "$bind_host" "$local_port"; then
+            listener_seen=true
+        fi
+        sleep 0.2
+
+        if has_forward_target_error; then
+            fail_forward_target "$local_port" "$target_host" "$remote_port"
+        fi
+
+        # Once a probe has reached the local listener without an SSH channel
+        # error, watch briefly for remote-side channel failures before handoff.
+        if [[ "$listener_seen" == true ]] && can_connect_local "$bind_host" "$local_port"; then
+            sleep 1
+            if has_forward_target_error; then
+                fail_forward_target "$local_port" "$target_host" "$remote_port"
+            fi
+            return 0
+        fi
+    done
+
+    fail "SSH did not open local port $local_port for $target_host:$remote_port."
 }
 
 prompt_manual_port() {
@@ -339,6 +746,24 @@ parse_manual_spec() {
     printf '%s\t%s\tmanual\ttcp\t%s\n' "manual:$remote" "$remote" "$localp"
 }
 
+format_manual_row() {
+    local label="$1" remote_port="$2" local_override="${3:-}"
+    [[ -n "$local_override" ]] || local_override="__AUTO__"
+    printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t%s\t__DEFAULT__' "$label" "$remote_port" "$remote_port" "$local_override"
+}
+
+format_add_manual_row() {
+    printf '%-30s %s\t%s\t%s\t%s\t__AUTO__\t__DEFAULT__' '[add custom port]' 'enter an arbitrary remote TCP port' '__ADD_MANUAL__' 'manual' 'tcp'
+}
+
+append_selection_row() {
+    local row="$1"
+    if [[ -n "$selection_rows" && "$selection_rows" != *$'\n' ]]; then
+        selection_rows+=$'\n'
+    fi
+    selection_rows+="$row"$'\n'
+}
+
 trap cleanup EXIT INT TERM HUP
 
 # Running Farward without a destination is intentionally non-destructive:
@@ -353,6 +778,12 @@ while (($#)); do
         -p|--port)
             [[ $# -ge 2 ]] || fail "--port requires REMOTE or REMOTE:LOCAL."
             MANUAL_SPECS+=("$2")
+            shift 2
+            ;;
+        -t|--target-host)
+            [[ $# -ge 2 ]] || fail "--target-host requires a host name or IPv4 address."
+            TARGET_HOST="$2"
+            TARGET_HOST_EXPLICIT=true
             shift 2
             ;;
         -m|--manual)
@@ -370,6 +801,18 @@ while (($#)); do
             ;;
         -o|--open)
             OPEN_BROWSER=true
+            shift
+            ;;
+        --diagnose)
+            DIAGNOSE=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --self-test)
+            SELF_TEST=true
             shift
             ;;
         -h|--help|help)
@@ -390,8 +833,21 @@ while (($#)); do
     esac
 done
 
+if [[ "$SELF_TEST" == true ]]; then
+    run_self_test
+    trap - EXIT
+    exit 0
+fi
+
 command_exists ssh || fail "ssh is required."
-if [[ "$MANUAL_ONLY" != true ]]; then
+validate_target_host "$TARGET_HOST" || fail "Target host '$TARGET_HOST' is invalid; use a hostname or IPv4 address containing only letters, numbers, dots, underscores, and hyphens."
+validate_bind_host "$LOCAL_BIND_HOST" || fail "Local bind host '$LOCAL_BIND_HOST' is invalid; use localhost, 127.0.0.1, or another IPv4 address."
+ssh_common_args=()
+if [[ -n "${FARWARD_SSH_CONFIG:-}" ]]; then
+    [[ -r "$FARWARD_SSH_CONFIG" ]] || fail "FARWARD_SSH_CONFIG '$FARWARD_SSH_CONFIG' is not readable."
+    ssh_common_args=(-F "$FARWARD_SSH_CONFIG")
+fi
+if [[ "$MANUAL_ONLY" != true && "$DISCOVER_DOCKER" == true ]]; then
     command_exists fzf || fail "fzf is required for the selector. Install it with: brew install fzf  OR  sudo apt install fzf"
 fi
 
@@ -400,7 +856,7 @@ printf 'Checking %s...\n' "$SSH_HOST"
 selection_rows=""
 if [[ "$DISCOVER_DOCKER" == true ]]; then
     remote_output="$(
-        ssh \
+        ssh_command \
             -o BatchMode=yes \
             -o ConnectTimeout=8 \
             "$SSH_HOST" \
@@ -411,12 +867,25 @@ if [[ "$DISCOVER_DOCKER" == true ]]; then
         ports="$(
             printf '%s\n' "$remote_output" |
             awk -F'|' '
+            function target_for(host) {
+                gsub(/^\[/, "", host)
+                gsub(/\]$/, "", host)
+                if (host == "" || host == "0.0.0.0" || host == "::" || host == ":::" || host == "*") {
+                    return "localhost"
+                }
+                if (host ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                    return host
+                }
+                return "localhost"
+            }
+
             {
                 container = $1
                 mappings = $2
 
                 while (match(mappings, /(([0-9a-fA-F:.]+):)?[0-9]+->[0-9]+\/(tcp|udp)/)) {
                     mapping = substr(mappings, RSTART, RLENGTH)
+                    host_side = mapping
                     protocol = mapping
                     sub(/^.*\//, "", protocol)
 
@@ -424,67 +893,96 @@ if [[ "$DISCOVER_DOCKER" == true ]]; then
                     host_side = arrow[1]
                     container_side = arrow[2]
 
+                    host_bind = host_side
+                    sub(/:[^:]*$/, "", host_bind)
                     sub(/^.*:/, "", host_side)
                     sub(/\/.*/, "", container_side)
 
-                    printf "%s\t%s\t%s\t%s\n", container, host_side, container_side, protocol
+                    printf "%s\t%s\t%s\t%s\t%s\n", container, host_side, container_side, protocol, target_for(host_bind)
                     mappings = substr(mappings, RSTART + RLENGTH)
                 }
             }' |
-            sort -t $'\t' -k1,1 -k2,2n -u
+            sort -t $'\t' -k1,1 -k2,2n -k5,5 -u
         )"
         if [[ -n "$ports" ]]; then
             selection_rows="$(
                 printf '%s\n' "$ports" |
-                awk -F'\t' '{ printf "%-30s host:%-6s container:%-6s %s\t%s\t%s\t%s\t\n", $1, $2, $3, $4, $2, $3, $4 }'
+                awk -F'\t' '{
+                    target_note = ($5 == "localhost" ? "" : " bind:" $5)
+                    printf "%-30s host:%-6s container:%-6s %s%s\t%s\t%s\t%s\t__AUTO__\t%s\n", $1, $2, $3, $4, target_note, $2, $3, $4, $5
+                }'
             )"
         fi
     fi
 fi
 
-for spec in "${MANUAL_SPECS[@]}"; do
-    parsed="$(parse_manual_spec "$spec")"
-    IFS=$'\t' read -r label remote_port _kind protocol local_override <<< "$parsed"
-    selection_rows+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t%s' "$label" "$remote_port" "$local_override")"$'\n'
-done
+if ((${#MANUAL_SPECS[@]} > 0)); then
+    for spec in "${MANUAL_SPECS[@]}"; do
+        parsed="$(parse_manual_spec "$spec")"
+        IFS=$'\t' read -r label remote_port _kind protocol local_override <<< "$parsed"
+        append_selection_row "$(format_manual_row "$label" "$remote_port" "$local_override")"
+    done
+fi
 
 if [[ "$MANUAL_ONLY" == true ]]; then
     selection=""
     while manual_row="$(prompt_manual_port)"; do
-        selection+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t' "${manual_row%%$'\t'*}" "$(printf '%s' "$manual_row" | cut -f2)")"$'\n'
+        remote_port="$(printf '%s' "$manual_row" | cut -f2)"
+        selection+="$(format_manual_row "${manual_row%%$'\t'*}" "$remote_port")"$'\n'
     done
     [[ -n "$selection" ]] || exit 0
-elif [[ -n "$selection_rows" ]]; then
-    selection_rows+="$(printf '%-30s %s\t%s\t%s\t%s\t' '[manual port]' 'enter an arbitrary remote TCP port' '__MANUAL__' 'manual' 'tcp')"
-    selection="$(
-        printf '%s\n' "$selection_rows" |
-        fzf \
-            --multi \
-            --delimiter=$'\t' \
-            --with-nth=1 \
-            --prompt='Forward ports > ' \
-            --header='TAB selects multiple ports · choose [manual port] for a standalone service' \
-            --height=80% \
-            --border
-    )" || exit 0
+elif [[ "$DISCOVER_DOCKER" != true ]]; then
+    selection="$selection_rows"
+    while [[ -z "$selection" ]] && manual_row="$(prompt_manual_port)"; do
+        remote_port="$(printf '%s' "$manual_row" | cut -f2)"
+        selection+="$(format_manual_row "${manual_row%%$'\t'*}" "$remote_port")"$'\n'
+    done
     [[ -n "$selection" ]] || exit 0
+else
+    while true; do
+        selector_rows="$selection_rows"
+        if [[ -n "$selector_rows" && "$selector_rows" != *$'\n' ]]; then
+            selector_rows+=$'\n'
+        fi
+        selector_rows+="$(format_add_manual_row)"
 
-    if grep -q $'\t__MANUAL__\t' <<< "$selection"; then
-        selection="$(printf '%s\n' "$selection" | grep -v $'\t__MANUAL__\t' || true)"
+        selection="$(
+            printf '%s\n' "$selector_rows" |
+            fzf \
+                --multi \
+                --delimiter=$'\t' \
+                --with-nth=1 \
+                --prompt='Forward ports > ' \
+                --header='TAB selects multiple ports · choose [add custom port] to add standalone services' \
+                --height=80% \
+                --border
+        )" || exit 0
+        [[ -n "$selection" ]] || exit 0
+
+        if ! grep -q $'\t__ADD_MANUAL__\t' <<< "$selection"; then
+            break
+        fi
+
+        selection="$(printf '%s\n' "$selection" | grep -v $'\t__ADD_MANUAL__\t' || true)"
+        added_selection=""
         while manual_row="$(prompt_manual_port)"; do
             remote_port="$(printf '%s' "$manual_row" | cut -f2)"
-            selection+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t' "manual:$remote_port" "$remote_port" "$remote_port")"$'\n'
+            manual_selection="$(format_manual_row "manual:$remote_port" "$remote_port")"
+            append_selection_row "$manual_selection"
+            added_selection+="$manual_selection"$'\n'
             printf 'Add another manual port? [y/N]: ' >/dev/tty
             IFS= read -r again </dev/tty
             [[ "$again" =~ ^[Yy]$ ]] || break
         done
-    fi
-else
-    printf 'No published Docker ports were found. Enter standalone remote ports instead.\n'
-    selection=""
-    while manual_row="$(prompt_manual_port)"; do
-        remote_port="$(printf '%s' "$manual_row" | cut -f2)"
-        selection+="$(printf '%-30s remote:%-6s standalone TCP\t%s\tmanual\ttcp\t' "manual:$remote_port" "$remote_port" "$remote_port")"$'\n'
+
+        if [[ -n "$added_selection" ]]; then
+            if [[ -n "$selection" ]]; then
+                selection+=$'\n'"$added_selection"
+            else
+                selection="$added_selection"
+            fi
+            break
+        fi
     done
     [[ -n "$selection" ]] || exit 0
 fi
@@ -492,23 +990,40 @@ fi
 forward_args=()
 summary=()
 urls=()
+probe_specs=()
+used_local_ports="|"
 
-while IFS=$'\t' read -r display remote_port container_port protocol local_override; do
+while IFS=$'\t' read -r display remote_port container_port protocol local_override target_override; do
+    [[ -n "${display}${remote_port}${container_port}${protocol}${local_override:-}${target_override:-}" ]] || continue
+    [[ "${local_override:-}" != "__AUTO__" ]] || local_override=""
+    [[ "${target_override:-}" != "__DEFAULT__" ]] || target_override=""
+
     [[ "$protocol" == "tcp" ]] || {
         printf 'Skipping UDP port %s; SSH local forwarding supports TCP only.\n' "$remote_port" >&2
         continue
     }
+
+    if [[ "$TARGET_HOST_EXPLICIT" == true || -z "${target_override:-}" ]]; then
+        target_host="$TARGET_HOST"
+    else
+        target_host="$target_override"
+    fi
+    validate_target_host "$target_host" || fail "Target host '$target_host' is invalid; use a hostname or IPv4 address containing only letters, numbers, dots, underscores, and hyphens."
 
     if [[ -n "${local_override:-}" ]]; then
         preferred_port="$local_override"
     else
         preferred_port="$(preferred_local_port "$remote_port")"
     fi
-    suggested_port="$(next_available_port "$preferred_port")"
+    if [[ -n "${local_override:-}" ]]; then
+        suggested_port="$preferred_port"
+    else
+        suggested_port="$(next_available_port "$preferred_port")"
+    fi
     local_port="$suggested_port"
 
     while true; do
-        if [[ -r /dev/tty && -w /dev/tty ]]; then
+        if [[ -z "${local_override:-}" && -t 0 && -r /dev/tty && -w /dev/tty ]]; then
             if (( remote_port < 1024 )); then
                 printf 'Remote port %s cannot normally bind to the same local port without elevated privileges.\n' "$remote_port"
             fi
@@ -518,7 +1033,7 @@ while IFS=$'\t' read -r display remote_port container_port protocol local_overri
         fi
 
         if [[ ! "$local_port" =~ ^[0-9]+$ ]] || (( local_port < 1 || local_port > 65535 )); then
-            if [[ -r /dev/tty && -w /dev/tty ]]; then
+            if [[ -z "${local_override:-}" && -t 0 && -r /dev/tty && -w /dev/tty ]]; then
                 printf 'Port "%s" is invalid. Enter a number between 1 and 65535.\n' "$local_port" >&2
                 local_port=""
                 continue
@@ -528,7 +1043,7 @@ while IFS=$'\t' read -r display remote_port container_port protocol local_overri
 
         if (( local_port < 1024 )) && [[ "$(id -u)" -ne 0 ]]; then
             suggested_port="$(next_available_port "$(preferred_local_port "$remote_port")")"
-            if [[ -r /dev/tty && -w /dev/tty ]]; then
+            if [[ -z "${local_override:-}" && -t 0 && -r /dev/tty && -w /dev/tty ]]; then
                 printf 'Local port %s is blocked for normal users. Choose an alternative; suggested: %s.\n'                     "$local_port" "$suggested_port" >&2
                 local_port=""
                 continue
@@ -538,7 +1053,7 @@ while IFS=$'\t' read -r display remote_port container_port protocol local_overri
 
         if ! is_port_available "$local_port"; then
             suggested_port="$(next_available_port "$((local_port + 1))")"
-            if [[ -r /dev/tty && -w /dev/tty ]]; then
+            if [[ -z "${local_override:-}" && -t 0 && -r /dev/tty && -w /dev/tty ]]; then
                 printf 'Local port %s is already in use. Choose an alternative; suggested: %s.\n'                     "$local_port" "$suggested_port" >&2
                 local_port=""
                 continue
@@ -549,17 +1064,27 @@ while IFS=$'\t' read -r display remote_port container_port protocol local_overri
         break
     done
 
-    forward_args+=("-L" "${local_port}:127.0.0.1:${remote_port}")
-    summary+=("localhost:${local_port}|${SSH_HOST}:${remote_port}")
+    if [[ "$used_local_ports" == *"|${local_port}|"* ]]; then
+        fail "Local port $local_port was selected more than once in this Farward session."
+    fi
+    used_local_ports+="${local_port}|"
+
+    forward_args+=("-L" "${LOCAL_BIND_HOST}:${local_port}:${target_host}:${remote_port}")
+    probe_specs+=("${LOCAL_BIND_HOST}|${local_port}|${target_host}|${remote_port}")
+    if [[ "$target_host" == "127.0.0.1" || "$target_host" == "localhost" ]]; then
+        summary+=("${LOCAL_BIND_HOST}:${local_port}|${SSH_HOST}:${remote_port}")
+    else
+        summary+=("${LOCAL_BIND_HOST}:${local_port}|${target_host}:${remote_port} via ${SSH_HOST}")
+    fi
 
     browser_port="$container_port"
     [[ "$container_port" == "manual" ]] && browser_port="$remote_port"
     case "$browser_port" in
         80|443|3000|4173|5000|5173|8000|8080|8025|7700)
             if [[ "$browser_port" == "443" ]]; then
-                urls+=("https://localhost:${local_port}")
+                urls+=("https://${LOCAL_BIND_HOST}:${local_port}")
             else
-                urls+=("http://localhost:${local_port}")
+                urls+=("http://${LOCAL_BIND_HOST}:${local_port}")
             fi
             ;;
     esac
@@ -567,22 +1092,84 @@ done <<< "$selection"
 
 ((${#forward_args[@]} > 0)) || fail "No TCP ports were selected."
 
-ssh_args=(
+ssh_args=()
+if ((${#ssh_common_args[@]} > 0)); then
+    ssh_args+=("${ssh_common_args[@]}")
+fi
+ssh_args+=(
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=30
     -o ServerAliveCountMax=3
     -o TCPKeepAlive=yes
 )
 
+if [[ "$DIAGNOSE" == true ]]; then
+    diagnose_failed=false
+    for spec in "${probe_specs[@]}"; do
+        IFS='|' read -r _probe_bind_host _probe_local_port probe_target_host probe_remote_port <<< "$spec"
+        diagnose_remote_target "$probe_target_host" "$probe_remote_port" || diagnose_failed=true
+    done
+    [[ "$diagnose_failed" != true ]] || fail "One or more remote targets are not reachable from $SSH_HOST."
+    printf 'All remote targets are reachable from %s.\n' "$SSH_HOST"
+    trap - EXIT
+    exit 0
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+    printf '\nResolved forwards:\n'
+    for item in "${summary[@]}"; do
+        printf '  %s -> %s\n' "${item%%|*}" "${item#*|}"
+    done
+    printf '\nSSH arguments:\n'
+    printf '  ssh'
+    for arg in "${ssh_args[@]:-}"; do
+        printf ' %q' "$arg"
+    done
+    for arg in "${forward_args[@]}"; do
+        printf ' %q' "$arg"
+    done
+    printf ' %q\n' "$SSH_HOST"
+    trap - EXIT
+    exit 0
+fi
+
 if [[ "$BACKGROUND" == true ]]; then
-    ssh "${ssh_args[@]}" -fN "${forward_args[@]}" "$SSH_HOST"
+    command_exists nohup || fail "nohup is required for background tunnels."
+
+    SSH_LOG="$(mktemp -t farward-ssh.XXXXXX)"
+    nohup ssh "${ssh_args[@]}" -n -N "${forward_args[@]}" "$SSH_HOST" >/dev/null 2>"$SSH_LOG" &
+    SSH_PID=$!
+
+    sleep 0.5
+    if ! kill -0 "$SSH_PID" 2>/dev/null; then
+        wait "$SSH_PID" || true
+        if [[ -s "$SSH_LOG" ]]; then
+            fail "SSH could not establish the selected forwards:
+$(cat "$SSH_LOG")"
+        fi
+        fail "SSH could not establish the selected forwards."
+    fi
+
+    for spec in "${probe_specs[@]}"; do
+        IFS='|' read -r probe_bind_host probe_local_port probe_target_host probe_remote_port <<< "$spec"
+        probe_forward_target "$probe_local_port" "$probe_bind_host" "$probe_target_host" "$probe_remote_port"
+    done
+
     printf '\nTunnel started in the background.\n'
     for item in "${summary[@]}"; do
         printf '  %s → %s\n' "${item%%|*}" "${item#*|}"
     done
     printf 'Stop it with: pkill -f "ssh.*%s"\n' "$SSH_HOST"
+    rm -f "$SSH_LOG" 2>/dev/null || true
+    SSH_LOG=""
+    disown "$SSH_PID" 2>/dev/null || true
+    SSH_PID=""
     trap - EXIT
     exit 0
+fi
+
+if [[ ! -t 1 || ! -r /dev/tty || ! -w /dev/tty ]]; then
+    fail "Foreground dashboard requires a terminal. Use --background for non-interactive runs."
 fi
 
 printf '\nStarting SSH tunnel...\n'
@@ -592,7 +1179,7 @@ done
 printf '\n'
 
 SSH_LOG="$(mktemp -t farward-ssh.XXXXXX)"
-ssh "${ssh_args[@]}" -N "${forward_args[@]}" "$SSH_HOST" 2>"$SSH_LOG" &
+ssh "${ssh_args[@]}" -n -N "${forward_args[@]}" "$SSH_HOST" 2>"$SSH_LOG" &
 SSH_PID=$!
 
 sleep 0.5
@@ -604,6 +1191,11 @@ $(cat "$SSH_LOG")"
     fi
     fail "SSH could not establish the selected forwards."
 fi
+
+for spec in "${probe_specs[@]}"; do
+    IFS='|' read -r probe_bind_host probe_local_port probe_target_host probe_remote_port <<< "$spec"
+    probe_forward_target "$probe_local_port" "$probe_bind_host" "$probe_target_host" "$probe_remote_port"
+done
 
 if [[ "$OPEN_BROWSER" == true ]]; then
     for url in "${urls[@]}"; do
