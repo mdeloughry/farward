@@ -117,8 +117,11 @@ command_exists() {
 
 ssh_command() {
     if ((${#ssh_common_args[@]} > 0)); then
+        # The remote command is expanded by the remote shell on purpose.
+        # shellcheck disable=SC2029
         ssh "${ssh_common_args[@]}" "$@"
     else
+        # shellcheck disable=SC2029
         ssh "$@"
     fi
 }
@@ -157,14 +160,13 @@ is_port_available() {
     local port="$1"
 
     if command_exists lsof; then
-        ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 1
     elif command_exists ss; then
-        ! ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN
+        ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN && return 1
     elif command_exists netstat; then
-        ! netstat -an 2>/dev/null | grep -Eq "[.:]${port}[[:space:]].*LISTEN"
-    else
-        return 0
+        netstat -an 2>/dev/null | grep -Eq "[.:]${port}[[:space:]].*LISTEN" && return 1
     fi
+    return 0
 }
 
 preferred_local_port() {
@@ -203,6 +205,7 @@ open_url() {
     fi
 }
 
+# shellcheck disable=SC2329 # invoked by trap
 cleanup() {
     local exit_code=$?
     trap - EXIT INT TERM HUP
@@ -311,7 +314,7 @@ put_text() {
 
     max_len=$((SCREEN_COLS - col))
     text="${text:0:max_len}"
-    SCREEN_LINES[$row]="${SCREEN_LINES[$row]:0:col}${text}${SCREEN_LINES[$row]:col+${#text}}"
+    SCREEN_LINES[row]="${SCREEN_LINES[row]:0:col}${text}${SCREEN_LINES[row]:col+${#text}}"
 }
 
 make_border() {
@@ -1455,6 +1458,7 @@ $(log_tail "$dir/log")"
     done < "$dir/forwards"
 }
 
+# shellcheck disable=SC2329 # invoked by trap
 supervisor_shutdown() {
     local dir="${SUPERVISOR_DIR:-}"
 

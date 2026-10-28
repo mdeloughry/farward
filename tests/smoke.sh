@@ -853,10 +853,10 @@ kill -0 "$pid_after" 2>/dev/null || {
     exit 1
 }
 ssh_pid_after_restart="$(meta_value "$session_id" ssh_pid)"
-[[ -n "$ssh_pid_after_restart" ]] && kill -0 "$ssh_pid_after_restart" 2>/dev/null || {
+if [[ -z "$ssh_pid_after_restart" ]] || ! kill -0 "$ssh_pid_after_restart" 2>/dev/null; then
     printf 'restart should start an ssh child\n' >&2
     exit 1
-}
+fi
 assert_contains "$(status_value "$session_id" state)" "connected"
 
 printf 'checking session prefix matching and stop\n'
@@ -950,10 +950,10 @@ reconnect_id="$(session_id_from_output "$reconnect_output")"
     exit 1
 }
 reconnect_old_ssh="$(meta_value "$reconnect_id" ssh_pid)"
-[[ -n "$reconnect_old_ssh" ]] && kill -0 "$reconnect_old_ssh" 2>/dev/null || {
+if [[ -z "$reconnect_old_ssh" ]] || ! kill -0 "$reconnect_old_ssh" 2>/dev/null; then
     printf 'expected an ssh child for reconnect test\n' >&2
     exit 1
-}
+fi
 kill "$reconnect_old_ssh"
 if ! reconnect_new_ssh="$(wait_for_session_field "$reconnect_id" ssh_pid "$reconnect_old_ssh" 100)"; then
     printf 'ssh child was not replaced after a drop\n' >&2

@@ -22,7 +22,7 @@ case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *)
         printf '\nAdd this to your shell configuration:\n'
-        printf '  export PATH="$HOME/.local/bin:$PATH"\n'
+        printf '%s\n' "  export PATH=\"\$HOME/.local/bin:\$PATH\""
         ;;
 esac
 
