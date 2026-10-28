@@ -1,5 +1,8 @@
 # Farward
 
+[![CI](https://github.com/mdeloughry/farward/actions/workflows/ci.yml/badge.svg)](https://github.com/mdeloughry/farward/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mdeloughry/farward)](https://github.com/mdeloughry/farward/releases/latest)
+
 Farward — forwarding from afar — is an interactive SSH port-forwarding dashboard for remote services. It can discover published Docker ports, forward ordinary standalone processes, or combine both in one session.
 
 ## Features
@@ -42,6 +45,28 @@ This installs:
 ~/.local/bin/farward
 ~/.local/bin/dockport -> farward
 ~/.local/bin/sail-ports -> farward
+```
+
+### From a release
+
+Download the tarball for the latest tag from the
+[releases page](https://github.com/mdeloughry/farward/releases/latest), extract
+it, and run `./install.sh` from the extracted directory.
+
+### Releasing
+
+CI runs the smoke test on Linux (bash 5) and macOS (bash 3.2) for every push
+and pull request. A `v*` tag also checks that the tag matches `FARWARD_VERSION`
+in `farward`, reruns the smoke test, and publishes the script, installer,
+tarball, and `SHA256SUMS` as a GitHub release.
+
+To cut a release:
+
+```bash
+# bump FARWARD_VERSION in farward first
+git commit -am "chore: release vX.Y.Z"
+git tag vX.Y.Z
+git push origin main --tags
 ```
 
 ## Help and safe default
@@ -221,14 +246,15 @@ You can also run `farward --no-docker mattbackup@mini` and use `[add custom port
     --listeners             Alias for --scan
     --no-scan               Never scan remote listeners, including auto-fallback
     --exclude PORT          Hide a remote port from Docker/scan rows; repeatable
--b, --background           Run tunnels without the dashboard
--o, --open                 Open recognised web-service ports
+    -b, --background       Run tunnels without the dashboard
+    -o, --open             Open recognised web-service ports
     --retry N              Reconnect a background tunnel up to N times (default 3, 0 disables)
     --retry-forever        Reconnect a background tunnel indefinitely
     --diagnose             Check remote target reachability and exit
     --dry-run              Print resolved forwards and SSH arguments without tunneling
     --self-test            Run Farward's local smoke test
--h, --help                 Show usage
+    -v, --version          Print the Farward version and exit
+    -h, --help             Show usage
 ```
 
 ## Managing background tunnels

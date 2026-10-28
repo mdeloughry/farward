@@ -181,6 +181,12 @@ require_command nc
 require_command expect
 
 bash -n "$FARWARD_BIN"
+printf 'checking --version\n'
+version_output="$("$FARWARD_BIN" --version)"
+[[ "$version_output" =~ ^(farward|dockport)[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    printf 'unexpected --version output: %s\n' "$version_output" >&2
+    exit 1
+}
 python3 - "$FARWARD_BIN" <<'PY'
 from pathlib import Path
 import sys

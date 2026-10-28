@@ -3,6 +3,7 @@
 set -Euo pipefail
 
 PROGRAM_NAME="$(basename "$0")"
+FARWARD_VERSION="0.1.0"
 DEFAULT_HOST="${FARWARD_HOST:-${DOCKPORT_HOST:-${SAIL_PORTS_HOST:-dev-box}}}"
 SSH_HOST="$DEFAULT_HOST"
 LOCAL_BIND_HOST="${FARWARD_BIND_HOST:-localhost}"
@@ -64,6 +65,7 @@ Options:
       --diagnose       Check remote target reachability and exit without tunneling
       --dry-run        Print resolved forwards and SSH arguments without tunneling
       --self-test      Run Farward's local smoke test and exit
+  -v, --version        Print the Farward version and exit
   -h, --help           Show this help
 
 Dashboard controls:
@@ -1730,6 +1732,10 @@ while (($#)); do
         --self-test)
             SELF_TEST=true
             shift
+            ;;
+        -v|--version)
+            printf '%s %s\n' "$PROGRAM_NAME" "$FARWARD_VERSION"
+            exit 0
             ;;
         -h|--help|help)
             usage

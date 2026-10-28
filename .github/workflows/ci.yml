@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint shell sources
+        run: shellcheck farward install.sh tests/smoke.sh scripts/setup-worktree.sh
+
+  test:
+    name: Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux bash 5
+            shell: bash
+          - os: macos-latest
+            label: macOS bash 3.2
+            shell: /bin/bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y expect netcat-openbsd
+      - name: Show shell version
+        run: ${{ matrix.shell }} --version
+      - name: Run smoke test
+        run: ${{ matrix.shell }} tests/smoke.sh
