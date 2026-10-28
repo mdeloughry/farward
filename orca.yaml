@@ -1,0 +1,9 @@
+# Orca repository hooks.
+#
+# Orca reads this file from the repo root and runs the setup command in a
+# "Setup" terminal whenever it creates a worktree. The command runs with the
+# new worktree as its working directory.
+#
+# Orca may ask you to trust this repo-defined hook once before running it.
+scripts:
+  setup: bash scripts/setup-worktree.sh

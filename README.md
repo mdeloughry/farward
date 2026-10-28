@@ -5,6 +5,8 @@ Farward — forwarding from afar — is an interactive SSH port-forwarding dashb
 ## Features
 
 - Discovers published Docker/Compose TCP ports with `docker ps`.
+- Scans every listening TCP port on the remote host with `--scan`, including
+  non-Docker services and their process names.
 - Adds arbitrary remote TCP ports for non-Docker applications.
 - Selects multiple services with `fzf`.
 - Supports direct `REMOTE` and `REMOTE:LOCAL` port specifications.
@@ -17,6 +19,10 @@ Farward — forwarding from afar — is an interactive SSH port-forwarding dashb
 - Probes started forwards and reports SSH channel-open failures before showing the dashboard.
 - Prompts when a local port is privileged, invalid, or already occupied.
 - Shows all active forwards in a responsive full-screen dashboard.
+- Registers background tunnels so they can be listed, inspected, restarted, and
+  stopped safely by session id.
+- Keeps background tunnels alive with a supervisor and bounded or unlimited
+  automatic reconnect after a dropped SSH process.
 - Type `:q` and press Enter (or type `q` and press Enter), or press Ctrl+C, to close every tunnel in the session.
 - Retains the legacy `dockport` and `sail-ports` commands as aliases.
 
@@ -66,7 +72,7 @@ After installation, you can also run:
 farward --self-test
 ```
 
-The smoke test uses a mock SSH process and temporary local ports to verify background forwarding, byte-level custom-port traffic, remote-side failure reporting, the foreground dashboard animation, and `:q` cleanup. When `sshd` and `ssh-keygen` are available, it also starts a temporary local SSH server and verifies a real OpenSSH custom-port tunnel end to end.
+The smoke test uses a mock SSH process and temporary local ports to verify background forwarding, byte-level custom-port traffic, remote-side failure reporting, session management, supervisor reconnect budgets, orphan cleanup, the foreground dashboard animation, and `:q` cleanup. When `sshd` and `ssh-keygen` are available, it also starts a temporary local SSH server and verifies a real OpenSSH custom-port tunnel end to end, including restart and stop.
 
 These are equivalent:
 
@@ -74,6 +80,31 @@ These are equivalent:
 farward help
 farward --help
 farward -h
+```
+
+## Orca worktrees
+
+Orca runs `scripts/setup-worktree.sh` automatically for each new worktree. The
+hook is declared in `orca.yaml` at the repo root, so it is shared with everyone
+who opens the repository in Orca. Orca may ask you to trust the hook once.
+Commit both `orca.yaml` and `scripts/setup-worktree.sh`: a new worktree only
+contains tracked files, so the setup command needs them on the branch.
+
+The setup script checks for `bash`, `git`, `ssh`, and the optional tools
+(`fzf`, `docker`, `nohup`, `python3`), makes the shell sources executable, and
+runs `bash -n` over them. It deliberately does not install anything globally,
+so a worktree cannot replace the `farward` in `~/.local/bin`.
+
+Run it by hand with:
+
+```bash
+scripts/setup-worktree.sh
+```
+
+Set `FARWARD_SETUP_SMOKE=1` to run the full smoke test as part of setup:
+
+```bash
+FARWARD_SETUP_SMOKE=1 scripts/setup-worktree.sh
 ```
 
 ## Docker and standalone services together
@@ -89,6 +120,51 @@ The selector contains discovered Docker mappings plus:
 ```
 
 Select it, enter the remote port, and Farward adds it to the selector as a standalone service. You can then select it with any Docker services and start them in the same dashboard.
+
+## Discovering non-Docker services
+
+Docker is not required. `--scan` asks the remote host for every TCP port that is
+listening and adds those services to the selector next to Docker's published
+ports:
+
+```bash
+farward --scan mattbackup@mini
+```
+
+The selector marks the source of each row:
+
+```text
+D web                    host:8080  container:80   tcp
+L postgres               host:5432  listener       tcp
+L node                   host:3000  listener       tcp bind:10.0.0.5
+L sshd                   host:22    listener       tcp
+[add custom port]  enter an arbitrary remote TCP port
+```
+
+`D` rows come from Docker; `L` rows are remote listeners. A listener bound to a
+specific address such as `10.0.0.5:3000` keeps that address as the forward
+target, exactly like a specific Docker bind.
+
+Scan listeners without contacting Docker:
+
+```bash
+farward --no-docker --scan mattbackup@mini
+```
+
+Hide noisy ports such as SSH:
+
+```bash
+farward --scan --exclude 22 mattbackup@mini
+```
+
+If Docker publishes nothing, Farward scans listeners automatically instead of
+dead-ending at `[add custom port]`. Disable that fallback with `--no-scan`.
+
+Farward uses whichever of `ss`, `lsof`, or `netstat` exists on the remote host.
+Process names may show `?` when the SSH user cannot inspect another user's
+processes; the forward still works. Only IPv4 targets are currently supported,
+so listeners bound exclusively to a specific IPv6 address are skipped with a
+summary warning.
 
 ## Directly add a standalone service
 
@@ -141,13 +217,93 @@ You can also run `farward --no-docker mattbackup@mini` and use `[add custom port
 -t, --target-host HOST     Remote-side host to connect to; default localhost
 -m, --manual               Prompt for standalone ports and skip Docker
     --no-docker             Disable Docker discovery
+    --scan                  Also list every TCP port listening on the remote host
+    --listeners             Alias for --scan
+    --no-scan               Never scan remote listeners, including auto-fallback
+    --exclude PORT          Hide a remote port from Docker/scan rows; repeatable
 -b, --background           Run tunnels without the dashboard
 -o, --open                 Open recognised web-service ports
+    --retry N              Reconnect a background tunnel up to N times (default 3, 0 disables)
+    --retry-forever        Reconnect a background tunnel indefinitely
     --diagnose             Check remote target reachability and exit
     --dry-run              Print resolved forwards and SSH arguments without tunneling
     --self-test            Run Farward's local smoke test
 -h, --help                 Show usage
 ```
+
+## Managing background tunnels
+
+`--background` registers the tunnel, so it can be managed without guessing PIDs
+or running `pkill`:
+
+```bash
+farward list                    # id, host, uptime, alive/stale, forward count
+farward logs <id>               # SSH stderr for that tunnel
+farward logs <id> -f            # follow it
+farward restart <id>            # relaunch with the same forwards
+farward stop <id>               # stop one tunnel
+farward stop --all              # stop every tunnel Farward started
+```
+
+A completed `--background` run prints its id and these commands:
+
+```text
+Tunnel started in the background.
+Session: 20261027-143012-4412-a1b2
+Host: mini
+  localhost:8347 → mini:8347
+
+Manage it with:
+  farward list
+  farward logs 20261027-143012-4412-a1b2
+  farward restart 20261027-143012-4412-a1b2
+  farward stop 20261027-143012-4412-a1b2
+```
+
+Ids can be abbreviated to any unique prefix. State lives in
+`${FARWARD_STATE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/farward}`, one directory
+per session (`meta`, `status`, `args`, `forwards`, `log`), created with mode
+`0700`.
+
+`list`, `logs`, `restart`, and `stop` are reserved command words. A host with one
+of those short names is still reachable by writing it as `user@list`.
+
+Before stopping or restarting, Farward checks that the recorded PID is still the
+session's supervisor by matching its command line against `--supervise` and the
+session directory. The SSH child is verified separately against the saved forward
+spec and host. A recycled PID is reported as `stale` and its state can be removed
+without signalling an unrelated process. `restart` also works on failed or stale
+sessions, which is the recovery path after a reboot.
+
+## Automatic reconnect
+
+Every background session is owned by a small detached supervisor. If SSH exits,
+the supervisor starts it again against the same saved arguments and forwards:
+
+```bash
+farward --background prod-tools                 # default: up to 3 reconnects
+farward --retry 10 --background prod-tools      # up to 10 reconnects
+farward --retry 0 --background prod-tools       # no reconnects
+farward --retry-forever --background prod-tools
+```
+
+Retries back off at 1, 2, 4, 8, 16, then 30 seconds. A connection that stays up
+for at least 30 seconds resets the budget, so a tunnel that drops months later
+gets the full allowance again. The budget is saved in the session, so
+`farward restart <id>` keeps it without repeating the flag.
+
+`farward list` reflects the supervisor state:
+
+| Status | Meaning |
+|---|---|
+| `alive` | supervisor and SSH child are running |
+| `starting` | supervisor is making its first connection |
+| `retry-N` | waiting to reconnect after drop N |
+| `failed` | retry budget exhausted; state kept for `logs`/`restart` |
+| `stale` | supervisor is gone and no failure state was recorded |
+
+`--retry` has no effect on foreground dashboard runs; Farward prints a note and
+continues normally.
 
 ## How forwarding works
 

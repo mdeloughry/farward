@@ -29,3 +29,5 @@ esac
 printf '\nRun it with:\n  farward user@remote-host\n'
 printf '\nVerify it with:\n  farward --self-test\n'
 printf '\nDashboard controls:\n  :q + Enter  stop tunnels and exit\n  Ctrl+C      stop tunnels and exit\n'
+printf '\nManage background tunnels:\n  farward list\n  farward logs <id>\n  farward restart <id>\n  farward stop --all\n'
+printf '\nBackground tunnels reconnect automatically (default 3 attempts).\n  Use --retry N or --retry-forever to change that.\n'

@@ -16,6 +16,10 @@ SELF_TEST=false
 DISCOVER_DOCKER=true
 MANUAL_ONLY=false
 MANUAL_SPECS=()
+SCAN=false
+SCAN_FLAG=false
+NO_SCAN=false
+EXCLUDE_PORTS="|"
 ssh_common_args=()
 SSH_PID=""
 SSH_LOG=""
@@ -24,6 +28,15 @@ COMMAND_BUFFER=""
 FRAME=0
 ORIG_TTY_SETTINGS=""
 DASHBOARD_TTY_POLL=false
+SESSION_DIR_PENDING=false
+SESSION_DIR=""
+SESSION_RESOLVED=""
+SSH_LOG_PERSIST=false
+MANAGED_PID=""
+SUPERVISOR_SSH_PID=""
+SUPERVISOR_DIR=""
+RETRY_LIMIT=3
+RETRY_FLAG=false
 
 usage() {
     cat <<USAGE
@@ -39,8 +52,15 @@ Options:
                        Remote-side host to connect to (default: $TARGET_HOST)
   -m, --manual         Skip Docker discovery and prompt for manual ports
       --no-docker      Do not inspect Docker; use only ports supplied with --port
+      --scan           Also list every TCP port listening on the remote host
+      --listeners      Alias for --scan
+      --no-scan        Never scan remote listeners, including the automatic fallback
+      --exclude PORT   Hide a remote port from Docker/scan results; repeatable
   -b, --background     Start the SSH tunnel in the background, without dashboard
   -o, --open           Open recognised HTTP services in the default browser
+      --retry N        Reconnect a background tunnel up to N times after a drop
+                       (0 disables; default 3)
+      --retry-forever  Keep reconnecting a background tunnel indefinitely
       --diagnose       Check remote target reachability and exit without tunneling
       --dry-run        Print resolved forwards and SSH arguments without tunneling
       --self-test      Run Farward's local smoke test and exit
@@ -50,11 +70,22 @@ Dashboard controls:
   :q                   Stop every tunnel started by this session and exit
   Ctrl+C               Stop every tunnel started by this session and exit
 
+Session commands:
+  $PROGRAM_NAME list                       List background tunnels
+  $PROGRAM_NAME logs ID [-f]               Show (or follow) a tunnel's SSH log
+  $PROGRAM_NAME restart ID                 Restart a tunnel with saved forwards
+  $PROGRAM_NAME stop ID                    Stop one background tunnel
+  $PROGRAM_NAME stop --all                 Stop every background tunnel
+
+Background sessions reconnect automatically (default 3 attempts).
+Use --retry N or --retry-forever to change the budget.
+
 Environment:
   FARWARD_HOST         Default SSH host (defaults to: dev-box)
   FARWARD_BIND_HOST    Local bind address for forwarded ports (defaults to: localhost)
   FARWARD_SSH_CONFIG   Optional ssh_config file to pass to ssh with -F
   FARWARD_TARGET_HOST  Remote-side target host for forwards (defaults to: localhost)
+  FARWARD_STATE_DIR    Background session state directory
   DOCKPORT_HOST        Legacy fallback for compatibility
   SAIL_PORTS_HOST      Legacy fallback for compatibility
 
@@ -63,6 +94,10 @@ Examples:
   $PROGRAM_NAME my-dev-box
   $PROGRAM_NAME --open user@docker-host
   $PROGRAM_NAME --background prod-tools
+  $PROGRAM_NAME list
+  $PROGRAM_NAME logs 20261027-143012-4412-a1b2
+  $PROGRAM_NAME restart 20261027
+  $PROGRAM_NAME stop --all
   $PROGRAM_NAME --port 8347 user@remote-host
   $PROGRAM_NAME --port 3000:13000 --port 8025 user@remote-host
   $PROGRAM_NAME --manual user@remote-host
@@ -175,12 +210,23 @@ cleanup() {
         wait "$SSH_PID" 2>/dev/null || true
     fi
 
+    if [[ -n "${MANAGED_PID:-}" ]] && kill -0 "$MANAGED_PID" 2>/dev/null; then
+        kill "$MANAGED_PID" 2>/dev/null || true
+        wait "$MANAGED_PID" 2>/dev/null || true
+    fi
+
     if [[ "$DASHBOARD_ACTIVE" == true ]]; then
         restore_dashboard_tty
         printf '\033[?2026l\033[?7h\033[?25h\033[?1049l'
     fi
 
-    [[ -n "${SSH_LOG:-}" ]] && rm -f "$SSH_LOG" 2>/dev/null || true
+    if [[ "$SESSION_DIR_PENDING" == true && -n "$SESSION_DIR" ]]; then
+        rm -rf "$SESSION_DIR" 2>/dev/null || true
+    fi
+
+    if [[ "$SSH_LOG_PERSIST" != true && -n "${SSH_LOG:-}" ]]; then
+        rm -f "$SSH_LOG" 2>/dev/null || true
+    fi
 
     exit "$exit_code"
 }
@@ -274,7 +320,7 @@ make_border() {
 }
 
 render_dashboard_frame() {
-    local size row col i item local_side remote_side
+    local row col i item local_side remote_side
     local panel_width panel_height panel_left panel_top inner_width
     local border title status command_line max_forwards visible_forwards
     local star_count x y glyph line panel_blank output=""
@@ -645,7 +691,10 @@ If the service is not bound to remote localhost, retry with --target-host HOST."
 }
 
 has_forward_target_error() {
-    [[ -s "$SSH_LOG" ]] && grep -Eiq "$(forward_target_error_pattern)" "$SSH_LOG"
+    local offset="${1:-0}"
+
+    [[ -s "$SSH_LOG" ]] && tail -n "+$((offset + 1))" "$SSH_LOG" |
+        grep -Eiq "$(forward_target_error_pattern)"
 }
 
 can_connect_local() {
@@ -684,10 +733,16 @@ probe_forward_target() {
     local remote_port="$4"
     local deadline
     local listener_seen=false
+    local log_offset=0
 
     command_exists python3 || command_exists nc || return 0
 
-    : >"$SSH_LOG"
+    if [[ "$SSH_LOG_PERSIST" == true ]]; then
+        log_offset="$(wc -l <"$SSH_LOG" 2>/dev/null | tr -d ' ' || true)"
+        [[ -n "$log_offset" ]] || log_offset=0
+    else
+        : >"$SSH_LOG"
+    fi
     deadline=$((SECONDS + 3))
     while (( SECONDS <= deadline )); do
         if can_connect_local "$bind_host" "$local_port"; then
@@ -695,7 +750,7 @@ probe_forward_target() {
         fi
         sleep 0.2
 
-        if has_forward_target_error; then
+        if has_forward_target_error "$log_offset"; then
             fail_forward_target "$local_port" "$target_host" "$remote_port"
         fi
 
@@ -703,7 +758,7 @@ probe_forward_target() {
         # error, watch briefly for remote-side channel failures before handoff.
         if [[ "$listener_seen" == true ]] && can_connect_local "$bind_host" "$local_port"; then
             sleep 1
-            if has_forward_target_error; then
+            if has_forward_target_error "$log_offset"; then
                 fail_forward_target "$local_port" "$target_host" "$remote_port"
             fi
             return 0
@@ -764,7 +819,808 @@ append_selection_row() {
     selection_rows+="$row"$'\n'
 }
 
+scan_remote_listeners() {
+    local remote_command
+
+    remote_command='printf "@@FARWARD_SCAN_BEGIN@@\n"
+if command -v ss >/dev/null 2>&1; then
+    printf "@@FARWARD_SCAN_TOOL:ss@@\n"
+    ss -ltnp 2>/dev/null || ss -ltn
+elif command -v lsof >/dev/null 2>&1; then
+    printf "@@FARWARD_SCAN_TOOL:lsof@@\n"
+    lsof -nP -iTCP -sTCP:LISTEN -F pcn 2>/dev/null
+elif command -v netstat >/dev/null 2>&1; then
+    printf "@@FARWARD_SCAN_TOOL:netstat@@\n"
+    netstat -ltnp 2>/dev/null || netstat -ltn
+else
+    exit 127
+fi'
+
+    ssh_command -o BatchMode=yes -o ConnectTimeout=8 "$SSH_HOST" "$remote_command"
+}
+
+# Normalises ss, lsof -F pcn and netstat output into "process<TAB>target<TAB>port".
+# Written for POSIX awk so the same program works with BSD awk and mawk.
+normalize_scan_output() {
+    LC_ALL=C awk '
+    function parse_local(hostport,   close_at, last_colon, k, host, port) {
+        NORM_TARGET = ""
+        NORM_PORT = ""
+        if (substr(hostport, 1, 1) == "[") {
+            close_at = index(hostport, "]")
+            if (close_at == 0) return 0
+            host = substr(hostport, 2, close_at - 2)
+            port = substr(hostport, close_at + 2)
+        } else {
+            last_colon = 0
+            for (k = length(hostport); k > 0; k--) {
+                if (substr(hostport, k, 1) == ":") {
+                    last_colon = k
+                    break
+                }
+            }
+            if (last_colon == 0) return 0
+            host = substr(hostport, 1, last_colon - 1)
+            port = substr(hostport, last_colon + 1)
+        }
+        sub(/%[^%]*$/, "", host)
+        if (port !~ /^[0-9]+$/) return 0
+        if (port + 0 < 1 || port + 0 > 65535) return 0
+        NORM_PORT = port + 0
+        if (host == "" || host == "*" || host == "0.0.0.0" || host == "::" || host == ":::") {
+            NORM_TARGET = "localhost"
+        } else if (host == "127.0.0.1" || host == "::1") {
+            NORM_TARGET = "localhost"
+        } else if (host ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            NORM_TARGET = host
+        } else {
+            NORM_TARGET = "skip"
+        }
+        return 1
+    }
+    function emit(name, hostport) {
+        if (!parse_local(hostport)) return
+        if (NORM_TARGET == "skip") {
+            skipped++
+            return
+        }
+        if (name == "") name = "?"
+        printf "%s\t%s\t%s\n", name, NORM_TARGET, NORM_PORT
+    }
+    BEGIN {
+        tool = ""
+        process = "?"
+        skipped = 0
+    }
+    /^@@FARWARD_SCAN_BEGIN@@/ { next }
+    /^@@FARWARD_SCAN_TOOL:/ {
+        tool = $0
+        sub(/^@@FARWARD_SCAN_TOOL:/, "", tool)
+        sub(/@@$/, "", tool)
+        next
+    }
+    tool == "lsof" {
+        if (substr($0, 1, 1) == "p") { process = "?"; next }
+        if (substr($0, 1, 1) == "c") { process = substr($0, 2); next }
+        if (substr($0, 1, 1) == "n") { emit(process, substr($0, 2)); next }
+        next
+    }
+    tool == "netstat" {
+        if ($1 ~ /^tcp/ && $6 == "LISTEN") {
+            program = $7
+            if (program == "" || program == "-") {
+                program = "?"
+            } else {
+                sub(/^[0-9]+\//, "", program)
+            }
+            emit(program, $4)
+        }
+        next
+    }
+    tool == "ss" {
+        if ($1 == "LISTEN") {
+            process = "?"
+            users_at = index($0, "users:((")
+            if (users_at > 0) {
+                rest = substr($0, users_at + 9)
+                split(rest, quoted, "\"")
+                if (quoted[1] != "") process = quoted[1]
+            }
+            emit(process, $4)
+        }
+        next
+    }
+    { next }
+    END { printf "@@FARWARD_SCAN_SKIPPED@@\t%d\n", skipped }
+    '
+}
+
+append_scan_rows() {
+    local scan_status scan_output scan_raw scan_skipped scan_normalized scan_added
+    local scan_proc scan_target scan_port scan_target_note scan_row
+    local _seen_display _seen_remote _seen_container _seen_protocol _seen_local _seen_target
+    local seen_listen_ports
+
+    scan_status=0
+    scan_output=""
+    if scan_output="$(scan_remote_listeners 2>&1)"; then
+        scan_status=0
+    else
+        scan_status=$?
+    fi
+
+    if (( scan_status == 127 )); then
+        printf 'Remote listener scan unavailable (no ss, lsof, or netstat on %s); continuing without it.\n' "$SSH_HOST" >&2
+    elif (( scan_status != 0 )); then
+        printf 'Remote listener scan failed on %s: %s\n' "$SSH_HOST" "$(printf '%s' "$scan_output" | head -n 1)" >&2
+    fi
+
+    scan_raw="$(printf '%s\n' "$scan_output" | normalize_scan_output)"
+    scan_skipped="$(printf '%s\n' "$scan_raw" | awk -F'\t' '$1 == "@@FARWARD_SCAN_SKIPPED@@" { total += $2 } END { print total + 0 }')"
+
+    # Docker wins on a port match: a published mapping and its docker-proxy
+    # listener (usually 0.0.0.0) describe the same service but normalise to
+    # different target hosts, so compare on the remote port alone.
+    seen_listen_ports="|"
+    if [[ -n "$selection_rows" ]]; then
+        while IFS=$'\t' read -r _seen_display _seen_remote _seen_container _seen_protocol _seen_local _seen_target; do
+            [[ -n "$_seen_remote" ]] || continue
+            seen_listen_ports+="${_seen_remote}|"
+        done <<< "$selection_rows"
+    fi
+
+    # Sort by port, then bind, with named processes ahead of "?" so dedupe keeps
+    # the informative row.
+    scan_normalized="$(
+        printf '%s\n' "$scan_raw" |
+            LC_ALL=C sort -t $'\t' -k3,3n -k2,2 -k1,1r |
+            LC_ALL=C awk -F'\t' 'NF >= 3 && !seen[$2 ":" $3]++'
+    )"
+
+    scan_added=0
+    while IFS=$'\t' read -r scan_proc scan_target scan_port; do
+        [[ -n "${scan_proc}${scan_target}${scan_port}" ]] || continue
+        [[ "$EXCLUDE_PORTS" == *"|${scan_port}|"* ]] && continue
+        if [[ "$seen_listen_ports" == *"|${scan_port}|"* ]]; then
+            continue
+        fi
+        seen_listen_ports+="${scan_port}|"
+
+        scan_proc="${scan_proc:0:28}"
+        scan_target_note=""
+        [[ "$scan_target" != "localhost" ]] && scan_target_note=" bind:${scan_target}"
+        printf -v scan_row 'L %-28s host:%-6s listener     %s%s\t%s\t%s\t%s\t__AUTO__\t%s' \
+            "$scan_proc" "$scan_port" "tcp" "$scan_target_note" \
+            "$scan_port" "$scan_port" "tcp" "$scan_target"
+        append_selection_row "$scan_row"
+        scan_added=$((scan_added + 1))
+    done <<< "$scan_normalized"
+
+    if (( scan_skipped > 0 )); then
+        printf 'Skipped %s IPv6-only listener(s); only IPv4 targets are supported yet.\n' "$scan_skipped" >&2
+    fi
+    if (( scan_added == 0 )); then
+        printf 'No remote listeners found.\n'
+    fi
+}
+
 trap cleanup EXIT INT TERM HUP
+
+farward_state_root() {
+    local base
+
+    if [[ -n "${FARWARD_STATE_DIR:-}" ]]; then
+        base="$FARWARD_STATE_DIR"
+    else
+        base="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/farward"
+    fi
+    while [[ "$base" == */ && "$base" != "/" ]]; do
+        base="${base%/}"
+    done
+    printf '%s\n' "$base"
+}
+
+new_session_id() {
+    printf '%s-%s-%04x\n' "$(date +%Y%m%d-%H%M%S)" "$$" "$RANDOM"
+}
+
+load_session_meta() {
+    local meta="$1" key value
+
+    SESSION_PID=""
+    SESSION_SSH_PID=""
+    SESSION_HOST=""
+    SESSION_STARTED=""
+    SESSION_BIND=""
+    SESSION_RETRIES="3"
+    [[ -r "$meta" ]] || return 1
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            pid) SESSION_PID="$value" ;;
+            ssh_pid) SESSION_SSH_PID="$value" ;;
+            host) SESSION_HOST="$value" ;;
+            started) SESSION_STARTED="$value" ;;
+            bind) SESSION_BIND="$value" ;;
+            retries) SESSION_RETRIES="$value" ;;
+        esac
+    done < "$meta"
+
+    [[ -n "$SESSION_HOST" ]]
+}
+
+write_session_meta() {
+    local dir="$1" id="$2" pid="$3" host="$4" bind="$5" retries="$6" ssh_pid="${7:-}"
+    local started
+
+    started="$(sed -n 's/^started=//p' "$dir/meta" 2>/dev/null | head -n 1 || true)"
+    [[ "$started" =~ ^[0-9]+$ ]] || started="$(date +%s)"
+
+    {
+        printf 'id=%s\n' "$id"
+        printf 'pid=%s\n' "$pid"
+        printf 'ssh_pid=%s\n' "$ssh_pid"
+        printf 'host=%s\n' "$host"
+        printf 'started=%s\n' "$started"
+        printf 'bind=%s\n' "$bind"
+        printf 'retries=%s\n' "$retries"
+        printf 'version=2\n'
+    } > "$dir/meta"
+    chmod 600 "$dir/meta" 2>/dev/null || true
+}
+
+update_meta_field() {
+    local dir="$1"
+    local key="$2"
+    local value="$3"
+    local tmp="$dir/meta.tmp"
+
+    awk -F'=' -v key="$key" -v value="$value" '
+        $1 == key { print key "=" value; found = 1; next }
+        { print }
+        END { if (!found) print key "=" value }
+    ' "$dir/meta" > "$tmp" || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$dir/meta"
+}
+
+load_session_status() {
+    local status_file="$1" key value
+
+    STATUS_STATE=""
+    STATUS_ATTEMPT=""
+    STATUS_PID=""
+    [[ -r "$status_file" ]] || return 1
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            state) STATUS_STATE="$value" ;;
+            attempt) STATUS_ATTEMPT="$value" ;;
+            pid) STATUS_PID="$value" ;;
+        esac
+    done < "$status_file"
+
+    [[ -n "$STATUS_STATE" ]]
+}
+
+write_session_status() {
+    local dir="$1" state="$2" attempt="$3" next_retry="$4" pid="$5" tmp
+    tmp="$dir/status.tmp"
+
+    {
+        printf 'state=%s\n' "$state"
+        printf 'attempt=%s\n' "$attempt"
+        printf 'next_retry=%s\n' "$next_retry"
+        printf 'pid=%s\n' "$pid"
+        printf 'updated=%s\n' "$(date +%s)"
+    } > "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$dir/status"
+}
+
+session_signature() {
+    local dir="$1" line prev=""
+
+    while IFS= read -r line; do
+        if [[ "$prev" == "-L" ]]; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+        prev="$line"
+    done < "$dir/forwards"
+    return 1
+}
+
+session_is_alive() {
+    local pid="$1" dir="$2" command_line
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -d "$dir" ]] || return 1
+
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command_line" == *"--supervise"* && "$command_line" == *"$dir"* ]]
+}
+
+ssh_session_is_alive() {
+    local pid="$1" dir="$2" command_line signature
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    signature="$(session_signature "$dir")" || return 1
+    [[ -n "$signature" ]] || return 1
+
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command_line" == *ssh* && "$command_line" == *"$signature"* && "$command_line" == *"$SESSION_HOST"* ]]
+}
+
+session_ports_available() {
+    local dir="$1" line prev="" bind local_port target_host remote_port
+
+    prev=""
+    while IFS= read -r line; do
+        if [[ "$prev" == "-L" ]]; then
+            IFS=: read -r bind local_port target_host remote_port <<< "$line"
+            is_port_available "$local_port" || return 1
+        fi
+        prev="$line"
+    done < "$dir/forwards"
+    return 0
+}
+
+format_uptime() {
+    local seconds="$1"
+
+    (( seconds < 0 )) && seconds=0
+    if (( seconds >= 86400 )); then
+        printf '%dd %02dh' "$((seconds / 86400))" "$(((seconds % 86400) / 3600))"
+    elif (( seconds >= 3600 )); then
+        printf '%dh %02dm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+    elif (( seconds >= 60 )); then
+        printf '%dm %02ds' "$((seconds / 60))" "$((seconds % 60))"
+    else
+        printf '%ds' "$seconds"
+    fi
+}
+
+resolve_session_id() {
+    local wanted="$1" root dir base matched="" count=0
+
+    [[ "$wanted" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$wanted" != "." && "$wanted" != ".." ]] || return 1
+
+    root="$(farward_state_root)"
+    dir="$root/$wanted"
+    if [[ -d "$dir" ]]; then
+        printf '%s\n' "$wanted"
+        return 0
+    fi
+
+    for dir in "$root"/*; do
+        [[ -d "$dir" ]] || continue
+        base="${dir##*/}"
+        if [[ "$base" == "$wanted"* ]]; then
+            matched="$base"
+            count=$((count + 1))
+        fi
+    done
+
+    (( count == 1 )) || return 1
+    printf '%s\n' "$matched"
+}
+
+resolve_or_fail() {
+    local wanted="$1" resolved
+
+    if ! resolved="$(resolve_session_id "$wanted")"; then
+        fail "No unique session matches '$wanted'. Run: farward list"
+    fi
+    SESSION_RESOLVED="$resolved"
+}
+
+terminate_session() {
+    local pid="$1" dir="$2" waited=0
+
+    session_is_alive "$pid" "$dir" || return 1
+
+    kill "$pid" 2>/dev/null || true
+    while (( waited < 30 )) && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if session_is_alive "$pid" "$dir"; then
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 0.1
+    fi
+    return 0
+}
+
+terminate_ssh_child() {
+    local pid="$1" dir="$2" waited=0
+
+    ssh_session_is_alive "$pid" "$dir" || return 1
+
+    kill "$pid" 2>/dev/null || true
+    while (( waited < 30 )) && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if ssh_session_is_alive "$pid" "$dir"; then
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 0.1
+    fi
+    return 0
+}
+
+stop_one_session() {
+    local id="$1" dir
+
+    [[ -n "$id" ]] || fail "No such session: $id"
+    dir="$(farward_state_root)/$id"
+    [[ -d "$dir" ]] || fail "No such session: $id"
+
+    if load_session_meta "$dir/meta"; then
+        if terminate_session "$SESSION_PID" "$dir"; then
+            printf 'Stopped session %s.\n' "$id"
+        else
+            printf 'Session %s was not running; cleaning up state.\n' "$id"
+        fi
+        terminate_ssh_child "$SESSION_SSH_PID" "$dir" || true
+    else
+        printf 'Session %s had no readable state; removing it.\n' "$id"
+    fi
+
+    rm -rf "$dir"
+}
+
+run_session_list() {
+    local root dir id forwards status uptime now found=0
+
+    root="$(farward_state_root)"
+    if [[ -d "$root" ]]; then
+        for dir in "$root"/*; do
+            [[ -d "$dir" ]] || continue
+            found=1
+            break
+        done
+    fi
+
+    if (( found == 0 )); then
+        printf 'No background sessions.\n'
+        return 0
+    fi
+
+    printf '%-26s %-16s %-10s %-7s %s\n' "ID" "HOST" "UPTIME" "STATUS" "FORWARDS"
+    now="$(date +%s)"
+    for dir in "$root"/*; do
+        [[ -d "$dir" ]] || continue
+        id="${dir##*/}"
+        if ! load_session_meta "$dir/meta"; then
+            printf '%-26s %-16s %-10s %-7s %s\n' "$id" "?" "-" "invalid" "0"
+            continue
+        fi
+
+        forwards="$(grep -c '^-L$' "$dir/forwards" 2>/dev/null || true)"
+        [[ -n "$forwards" ]] || forwards=0
+
+        load_session_status "$dir/status" || true
+        if session_is_alive "$SESSION_PID" "$dir"; then
+            case "$STATUS_STATE" in
+                connecting) status="starting" ;;
+                reconnecting) status="retry-${STATUS_ATTEMPT:-?}" ;;
+                failed) status="failed" ;;
+                *) status="alive" ;;
+            esac
+        elif [[ "$STATUS_STATE" == "failed" ]]; then
+            status="failed"
+        else
+            status="stale"
+        fi
+
+        if [[ "$SESSION_STARTED" =~ ^[0-9]+$ ]]; then
+            uptime="$(format_uptime "$((now - SESSION_STARTED))")"
+        else
+            uptime="-"
+        fi
+
+        printf '%-26s %-16s %-10s %-7s %s\n' "$id" "$SESSION_HOST" "$uptime" "$status" "$forwards"
+    done
+}
+
+run_session_stop() {
+    local all=false arg id="" root dir found=0
+
+    for arg in "$@"; do
+        case "$arg" in
+            --all) all=true ;;
+            -h|--help) usage; return 0 ;;
+            -*) fail "Unknown option for stop: $arg" ;;
+            *)
+                [[ -z "$id" ]] || fail "farward stop accepts one session id or --all."
+                id="$arg"
+                ;;
+        esac
+    done
+
+    root="$(farward_state_root)"
+    if [[ "$all" == true ]]; then
+        if [[ -d "$root" ]]; then
+            for dir in "$root"/*; do
+                [[ -d "$dir" ]] || continue
+                stop_one_session "${dir##*/}"
+                found=$((found + 1))
+            done
+        fi
+        (( found > 0 )) || printf 'No background sessions.\n'
+        return 0
+    fi
+
+    [[ -n "$id" ]] || fail "farward stop requires a session id or --all."
+    resolve_or_fail "$id"
+    stop_one_session "$SESSION_RESOLVED"
+}
+
+run_session_logs() {
+    local follow=false arg id="" dir
+
+    for arg in "$@"; do
+        case "$arg" in
+            -f|--follow) follow=true ;;
+            -h|--help) usage; return 0 ;;
+            -*) fail "Unknown option for logs: $arg" ;;
+            *)
+                [[ -z "$id" ]] || fail "farward logs accepts one session id."
+                id="$arg"
+                ;;
+        esac
+    done
+
+    [[ -n "$id" ]] || fail "farward logs requires a session id."
+    resolve_or_fail "$id"
+    id="$SESSION_RESOLVED"
+    dir="$(farward_state_root)/$id"
+    [[ -f "$dir/log" ]] || fail "No log file for session $id."
+
+    if [[ "$follow" == true ]]; then
+        tail -f "$dir/log"
+    else
+        cat "$dir/log"
+    fi
+}
+
+process_running() {
+    local pid="$1" state
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+    [[ -n "$state" && "$state" != *Z* ]]
+}
+
+log_tail() {
+    local file="$1"
+
+    [[ -s "$file" ]] || return 0
+    tail -n 20 "$file"
+}
+
+wait_for_supervisor_connection() {
+    local dir="$1" pid="$2" waited=0
+
+    while (( waited < 100 )); do
+        process_running "$pid" || return 1
+        if load_session_status "$dir/status"; then
+            case "$STATUS_STATE" in
+                connected)
+                    [[ -n "$STATUS_PID" ]] && kill -0 "$STATUS_PID" 2>/dev/null && return 0
+                    ;;
+                failed)
+                    return 1
+                    ;;
+            esac
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+launch_managed_session() {
+    local dir="$1" host="$2" arg spec prev bind local_port target_host remote_port self
+
+    command_exists nohup || fail "nohup is required for background tunnels."
+    self="$(script_path)" || fail "Could not determine the Farward executable path."
+    [[ -x "$self" ]] || fail "Farward is not executable at $self."
+
+    SSH_LOG="$dir/log"
+    SSH_LOG_PERSIST=true
+
+    nohup "$self" --supervise "$dir" >/dev/null 2>>"$dir/log" &
+    MANAGED_PID=$!
+
+    if ! wait_for_supervisor_connection "$dir" "$MANAGED_PID"; then
+        fail "Supervisor could not establish the selected forwards:
+$(log_tail "$dir/log")"
+    fi
+
+    prev=""
+    while IFS= read -r spec; do
+        if [[ "$prev" == "-L" ]]; then
+            IFS=: read -r bind local_port target_host remote_port <<< "$spec"
+            probe_forward_target "$local_port" "$bind" "$target_host" "$remote_port"
+        fi
+        prev="$spec"
+    done < "$dir/forwards"
+}
+
+supervisor_shutdown() {
+    local dir="${SUPERVISOR_DIR:-}"
+
+    trap - INT TERM HUP
+
+    if [[ -n "${SUPERVISOR_SSH_PID:-}" ]] && process_running "$SUPERVISOR_SSH_PID"; then
+        kill "$SUPERVISOR_SSH_PID" 2>/dev/null || true
+        wait "$SUPERVISOR_SSH_PID" 2>/dev/null || true
+    fi
+    SUPERVISOR_SSH_PID=""
+
+    if [[ -n "$dir" && -d "$dir" ]]; then
+        write_session_status "$dir" stopped 0 0 "" || true
+        update_meta_field "$dir" ssh_pid "" || true
+    fi
+    exit 0
+}
+
+# Waits for the SSH child, but exits early if its session directory disappears
+# (for example a manual rm -rf) so a supervising process cannot become an
+# untracked background daemon. Returns 2 when the state is gone.
+wait_for_ssh_child() {
+    local pid="$1" dir="$2" state
+
+    while :; do
+        state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+        [[ -n "$state" && "$state" != *Z* ]] || break
+        if [[ ! -d "$dir" || ! -f "$dir/meta" ]]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 2
+        fi
+        sleep 1
+    done
+    wait "$pid" 2>/dev/null || true
+    return 0
+}
+
+run_session_supervisor() {
+    local dir="$1" arg spec prev bind local_port target_host remote_port
+    local launch_args=()
+    local launch_forwards=()
+    local retries attempt=0 delay=1 started child_rc
+
+    [[ -d "$dir" ]] || fail "No such session directory: $dir"
+    [[ -f "$dir/args" && -f "$dir/forwards" ]] ||
+        fail "Session state is incomplete: $dir"
+    SUPERVISOR_DIR="$dir"
+    trap 'supervisor_shutdown' INT TERM HUP
+    trap - EXIT
+
+    load_session_meta "$dir/meta" || fail "Session state is unreadable: $dir"
+    retries="$SESSION_RETRIES"
+    update_meta_field "$dir" pid "$$" || true
+
+    while IFS= read -r arg; do
+        launch_args+=("$arg")
+    done < "$dir/args"
+    while IFS= read -r arg; do
+        launch_forwards+=("$arg")
+    done < "$dir/forwards"
+
+    while :; do
+        if [[ ! -d "$dir" || ! -f "$dir/meta" ]]; then
+            exit 0
+        fi
+
+        if ! session_ports_available "$dir"; then
+            printf '%s supervisor: a local forward port is already in use; treating attempt %s as failed\n' \
+                "$(date)" "$attempt" >>"$dir/log"
+        else
+            write_session_status "$dir" connecting "$attempt" 0 ""
+            ssh "${launch_args[@]}" -n -N "${launch_forwards[@]}" "$SESSION_HOST" \
+                >>"$dir/log" 2>&1 &
+            SUPERVISOR_SSH_PID=$!
+            update_meta_field "$dir" ssh_pid "$SUPERVISOR_SSH_PID" || true
+            write_session_status "$dir" connected "$attempt" 0 "$SUPERVISOR_SSH_PID" || true
+
+            started="$(date +%s)"
+            wait_for_ssh_child "$SUPERVISOR_SSH_PID" "$dir"
+            child_rc=$?
+            SUPERVISOR_SSH_PID=""
+            if (( child_rc == 2 )); then
+                exit 0
+            fi
+            update_meta_field "$dir" ssh_pid "" || true
+
+            if (( $(date +%s) - started >= 30 )); then
+                attempt=0
+                delay=1
+            fi
+        fi
+
+        if [[ "$retries" != "-1" ]] && (( attempt >= retries )); then
+            printf '%s supervisor: giving up after %s retries\n' "$(date)" "$attempt" >>"$dir/log"
+            write_session_status "$dir" failed "$attempt" 0 "" || true
+            exit 1
+        fi
+
+        attempt=$((attempt + 1))
+        next=$(( $(date +%s) + delay ))
+        write_session_status "$dir" reconnecting "$attempt" "$next" "" || true
+        printf '%s supervisor: reconnecting in %ss (attempt %s)\n' \
+            "$(date)" "$delay" "$attempt" >>"$dir/log"
+        sleep "$delay"
+        delay=$((delay * 2))
+        (( delay > 30 )) && delay=30
+    done
+}
+
+run_session_restart() {
+    local arg id="" root dir spec prev local_port waited
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help) usage; return 0 ;;
+            -*) fail "Unknown option for restart: $arg" ;;
+            *)
+                [[ -z "$id" ]] || fail "farward restart accepts one session id."
+                id="$arg"
+                ;;
+        esac
+    done
+
+    [[ -n "$id" ]] || fail "farward restart requires a session id."
+    resolve_or_fail "$id"
+    id="$SESSION_RESOLVED"
+    root="$(farward_state_root)"
+    dir="$root/$id"
+    [[ -f "$dir/args" && -f "$dir/forwards" ]] ||
+        fail "Session $id is missing saved arguments and cannot be restarted."
+    load_session_meta "$dir/meta" || fail "Session $id has no readable state."
+
+    terminate_session "$SESSION_PID" "$dir" || true
+    terminate_ssh_child "$SESSION_SSH_PID" "$dir" || true
+
+    prev=""
+    while IFS= read -r spec; do
+        if [[ "$prev" == "-L" ]]; then
+            IFS=: read -r _bind local_port _target_port _rest <<< "$spec"
+            waited=0
+            while (( waited < 20 )) && ! is_port_available "$local_port"; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            is_port_available "$local_port" ||
+                fail "Local port $local_port is still in use; cannot restart session $id."
+        fi
+        prev="$spec"
+    done < "$dir/forwards"
+
+    rm -f "$dir/status" "$dir/status.tmp"
+    printf '\n--- restarted %s ---\n' "$(date)" >> "$dir/log"
+    write_session_meta "$dir" "$id" "" "$SESSION_HOST" "$SESSION_BIND" "$SESSION_RETRIES"
+    launch_managed_session "$dir" "$SESSION_HOST"
+
+    printf 'Session %s restarted on %s.\n' "$id" "$SESSION_HOST"
+    while IFS= read -r spec; do
+        [[ "$spec" == -* ]] || printf '  %s\n' "$spec"
+    done < "$dir/forwards"
+
+    disown "$MANAGED_PID" 2>/dev/null || true
+    MANAGED_PID=""
+    SSH_PID=""
+    SSH_LOG=""
+    SSH_LOG_PERSIST=false
+    SESSION_DIR_PENDING=false
+    trap - EXIT
+}
 
 # Running Farward without a destination is intentionally non-destructive:
 # show help instead of guessing a host or attempting an SSH connection.
@@ -772,6 +1628,39 @@ if (( $# == 0 )); then
     usage
     exit 0
 fi
+
+case "$1" in
+    --supervise)
+        [[ $# -ge 2 ]] || fail "--supervise requires a session directory."
+        run_session_supervisor "$2"
+        trap - EXIT
+        exit 0
+        ;;
+    list|sessions)
+        shift
+        run_session_list "$@"
+        trap - EXIT
+        exit 0
+        ;;
+    stop)
+        shift
+        run_session_stop "$@"
+        trap - EXIT
+        exit 0
+        ;;
+    logs)
+        shift
+        run_session_logs "$@"
+        trap - EXIT
+        exit 0
+        ;;
+    restart)
+        shift
+        run_session_restart "$@"
+        trap - EXIT
+        exit $?
+        ;;
+esac
 
 while (($#)); do
     case "$1" in
@@ -795,12 +1684,39 @@ while (($#)); do
             DISCOVER_DOCKER=false
             shift
             ;;
+        --scan|--listeners)
+            SCAN=true
+            SCAN_FLAG=true
+            shift
+            ;;
+        --no-scan)
+            NO_SCAN=true
+            shift
+            ;;
+        --exclude)
+            [[ $# -ge 2 ]] || fail "--exclude requires a port number."
+            validate_port_number "$2" || fail "--exclude '$2' is invalid; use a number from 1 to 65535."
+            EXCLUDE_PORTS+="$2|"
+            shift 2
+            ;;
         -b|--background)
             BACKGROUND=true
             shift
             ;;
         -o|--open)
             OPEN_BROWSER=true
+            shift
+            ;;
+        --retry)
+            [[ $# -ge 2 ]] || fail "--retry requires a non-negative integer."
+            [[ "$2" =~ ^[0-9]+$ ]] || fail "--retry '$2' is invalid; use a non-negative integer."
+            RETRY_LIMIT="$2"
+            RETRY_FLAG=true
+            shift 2
+            ;;
+        --retry-forever)
+            RETRY_LIMIT=-1
+            RETRY_FLAG=true
             shift
             ;;
         --diagnose)
@@ -833,6 +1749,14 @@ while (($#)); do
     esac
 done
 
+if [[ "$MANUAL_ONLY" == true && "$SCAN_FLAG" == true ]]; then
+    fail "--manual and --scan are mutually exclusive; use --no-docker --scan."
+fi
+
+if [[ "$RETRY_FLAG" == true && "$BACKGROUND" != true ]]; then
+    printf 'Note: auto-reconnect applies to --background sessions; this run will not reconnect.\n'
+fi
+
 if [[ "$SELF_TEST" == true ]]; then
     run_self_test
     trap - EXIT
@@ -847,7 +1771,7 @@ if [[ -n "${FARWARD_SSH_CONFIG:-}" ]]; then
     [[ -r "$FARWARD_SSH_CONFIG" ]] || fail "FARWARD_SSH_CONFIG '$FARWARD_SSH_CONFIG' is not readable."
     ssh_common_args=(-F "$FARWARD_SSH_CONFIG")
 fi
-if [[ "$MANUAL_ONLY" != true && "$DISCOVER_DOCKER" == true ]]; then
+if [[ "$MANUAL_ONLY" != true ]] && { [[ "$DISCOVER_DOCKER" == true ]] || [[ "$SCAN" == true ]]; }; then
     command_exists fzf || fail "fzf is required for the selector. Install it with: brew install fzf  OR  sudo apt install fzf"
 fi
 
@@ -855,15 +1779,24 @@ printf 'Checking %s...\n' "$SSH_HOST"
 
 selection_rows=""
 if [[ "$DISCOVER_DOCKER" == true ]]; then
-    remote_output="$(
+    docker_status=0
+    if remote_output="$(
         ssh_command \
             -o BatchMode=yes \
             -o ConnectTimeout=8 \
             "$SSH_HOST" \
             "docker ps --format '{{.Names}}|{{.Ports}}'" 2>&1
-    )" || remote_output=""
+    )"; then
+        docker_status=0
+    else
+        docker_status=$?
+    fi
 
-    if [[ -n "$remote_output" ]]; then
+    if (( docker_status != 0 )); then
+        printf 'Docker discovery failed on %s: %s\n' "$SSH_HOST" "$(printf '%s' "$remote_output" | head -n 1)" >&2
+    fi
+
+    if (( docker_status == 0 )) && [[ -n "$remote_output" ]]; then
         ports="$(
             printf '%s\n' "$remote_output" |
             awk -F'|' '
@@ -907,13 +1840,23 @@ if [[ "$DISCOVER_DOCKER" == true ]]; then
         if [[ -n "$ports" ]]; then
             selection_rows="$(
                 printf '%s\n' "$ports" |
-                awk -F'\t' '{
+                awk -F'\t' -v exclude="$EXCLUDE_PORTS" '{
+                    if (index(exclude, "|" $2 "|") > 0) next
                     target_note = ($5 == "localhost" ? "" : " bind:" $5)
-                    printf "%-30s host:%-6s container:%-6s %s%s\t%s\t%s\t%s\t__AUTO__\t%s\n", $1, $2, $3, $4, target_note, $2, $3, $4, $5
+                    printf "D %-28s host:%-6s container:%-6s %s%s\t%s\t%s\t%s\t__AUTO__\t%s\n", $1, $2, $3, $4, target_note, $2, $3, $4, $5
                 }'
             )"
         fi
     fi
+fi
+
+if [[ "$DISCOVER_DOCKER" == true && "$SCAN" != true && "$NO_SCAN" != true && "$MANUAL_ONLY" != true && -z "$selection_rows" ]]; then
+    printf 'No published Docker ports found; scanning remote listeners...\n'
+    SCAN=true
+fi
+
+if [[ "$SCAN" == true ]]; then
+    append_scan_rows
 fi
 
 if ((${#MANUAL_SPECS[@]} > 0)); then
@@ -931,7 +1874,7 @@ if [[ "$MANUAL_ONLY" == true ]]; then
         selection+="$(format_manual_row "${manual_row%%$'\t'*}" "$remote_port")"$'\n'
     done
     [[ -n "$selection" ]] || exit 0
-elif [[ "$DISCOVER_DOCKER" != true ]]; then
+elif [[ "$DISCOVER_DOCKER" != true && "$SCAN" != true ]]; then
     selection="$selection_rows"
     while [[ -z "$selection" ]] && manual_row="$(prompt_manual_port)"; do
         remote_port="$(printf '%s' "$manual_row" | cut -f2)"
@@ -1136,34 +2079,53 @@ fi
 if [[ "$BACKGROUND" == true ]]; then
     command_exists nohup || fail "nohup is required for background tunnels."
 
-    SSH_LOG="$(mktemp -t farward-ssh.XXXXXX)"
-    nohup ssh "${ssh_args[@]}" -n -N "${forward_args[@]}" "$SSH_HOST" >/dev/null 2>"$SSH_LOG" &
-    SSH_PID=$!
+    state_root="$(farward_state_root)"
+    mkdir -p "$state_root" 2>/dev/null || fail "Could not create session state directory: $state_root"
+    chmod 700 "$state_root" 2>/dev/null || true
 
-    sleep 0.5
-    if ! kill -0 "$SSH_PID" 2>/dev/null; then
-        wait "$SSH_PID" || true
-        if [[ -s "$SSH_LOG" ]]; then
-            fail "SSH could not establish the selected forwards:
-$(cat "$SSH_LOG")"
-        fi
-        fail "SSH could not establish the selected forwards."
+    session_id="$(new_session_id)"
+    session_dir="$state_root/$session_id"
+    while ! mkdir "$session_dir" 2>/dev/null; do
+        session_id="$(new_session_id)"
+        session_dir="$state_root/$session_id"
+    done
+    chmod 700 "$session_dir" 2>/dev/null || true
+    SESSION_DIR_PENDING=true
+    SESSION_DIR="$session_dir"
+
+    session_args=("${ssh_args[@]}")
+    printf '%s\n' "${session_args[@]}" >"$session_dir/args"
+    printf '%s\n' "${forward_args[@]}" >"$session_dir/forwards"
+    : >"$session_dir/log"
+    chmod 600 "$session_dir/args" "$session_dir/forwards" "$session_dir/log" 2>/dev/null || true
+    write_session_meta "$session_dir" "$session_id" "" "$SSH_HOST" "$LOCAL_BIND_HOST" "$RETRY_LIMIT"
+
+    launch_managed_session "$session_dir" "$SSH_HOST"
+
+    if [[ "$OPEN_BROWSER" == true ]]; then
+        for url in "${urls[@]}"; do
+            open_url "$url"
+        done
     fi
 
-    for spec in "${probe_specs[@]}"; do
-        IFS='|' read -r probe_bind_host probe_local_port probe_target_host probe_remote_port <<< "$spec"
-        probe_forward_target "$probe_local_port" "$probe_bind_host" "$probe_target_host" "$probe_remote_port"
-    done
-
     printf '\nTunnel started in the background.\n'
+    printf 'Session: %s\n' "$session_id"
+    printf 'Host: %s\n' "$SSH_HOST"
     for item in "${summary[@]}"; do
         printf '  %s → %s\n' "${item%%|*}" "${item#*|}"
     done
-    printf 'Stop it with: pkill -f "ssh.*%s"\n' "$SSH_HOST"
-    rm -f "$SSH_LOG" 2>/dev/null || true
-    SSH_LOG=""
-    disown "$SSH_PID" 2>/dev/null || true
+    printf '\nManage it with:\n'
+    printf '  farward list\n'
+    printf '  farward logs %s\n' "$session_id"
+    printf '  farward restart %s\n' "$session_id"
+    printf '  farward stop %s\n' "$session_id"
+
+    SESSION_DIR_PENDING=false
+    disown "$MANAGED_PID" 2>/dev/null || true
+    MANAGED_PID=""
     SSH_PID=""
+    SSH_LOG=""
+    SSH_LOG_PERSIST=false
     trap - EXIT
     exit 0
 fi
